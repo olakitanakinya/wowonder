@@ -1,0 +1,75 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mysql-init
+  namespace: wowonder
+spec:
+  template:
+    spec:
+      containers:
+      - name: mysql-init
+        image: mysql:8.0
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+          echo "Waiting for MySQL to be ready..."
+          until mysql -h mysql-service -u root -prootpassword -e "SELECT 1"; do
+            echo "MySQL not ready yet... waiting 5 seconds"
+            sleep 5
+          done
+          
+          echo "MySQL is ready! Initializing database..."
+          
+          # Create database and user (idempotent)
+          mysql -h mysql-service -u root -prootpassword -e "
+            CREATE DATABASE IF NOT EXISTS wowonderdb;
+            CREATE USER IF NOT EXISTS 'wowonderuser'@'%' IDENTIFIED BY 'Password123@24';
+            GRANT ALL PRIVILEGES ON wowonderdb.* TO 'wowonderuser'@'%';
+            FLUSH PRIVILEGES;
+            SHOW DATABASES;
+          "
+          
+          # Import SQL file if it exists in the container
+          if [ -f /docker-entrypoint-initdb.d/wowonderdb.sql ]; then
+            echo "Importing database schema..."
+            mysql -h mysql-service -u root -prootpassword wowonderdb < /docker-entrypoint-initdb.d/wowonderdb.sql
+            echo "Database imported successfully"
+          else
+            echo "No SQL file found at /docker-entrypoint-initdb.d/wowonderdb.sql"
+            echo "Creating basic tables structure..."
+            mysql -h mysql-service -u root -prootpassword wowonderdb -e "
+              CREATE TABLE IF NOT EXISTS users (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                username VARCHAR(255),
+                email VARCHAR(255),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+              );
+            "
+          fi
+          
+          echo "Database initialization completed successfully!"
+        volumeMounts:
+        - name: database-script
+          mountPath: /docker-entrypoint-initdb.d
+        env:
+        - name: MYSQL_HOST
+          value: "mysql-service"
+        - name: MYSQL_ROOT_PASSWORD
+          value: "rootpassword"
+      restartPolicy: OnFailure
+      volumes:
+      - name: database-script
+        configMap:
+          name: wowonder-database-init
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wowonder-database-init
+  namespace: wowonder
+data:
+  init.sql: |
+    -- This file will be replaced by the actual wowonderdb.sql during deployment
+    SELECT 'Database will be initialized during deployment' as status;

@@ -1,0 +1,218 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wowonder-nginx-config
+  namespace: wowonder
+data:
+  default.conf: |
+    server {
+        listen 80;
+        server_name _;
+        root /var/www/html;
+        index index.php index.html;
+
+        client_max_body_size 2024M;
+        client_body_timeout 5000s;
+        fastcgi_read_timeout 4000s;
+        fastcgi_send_timeout 4000s;
+
+        # Main location block
+        location / {
+            try_files $uri $uri/ /index.php?$query_string;
+        }
+
+        # PHP handling
+        location ~ \.php$ {
+            include fastcgi_params;
+            fastcgi_pass 127.0.0.1:9000;
+            fastcgi_index index.php;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        }
+
+        # Handle uploads directory
+        location /upload/ {
+            alias /var/www/html/upload/;
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+            try_files $uri $uri/ =404;
+        }
+
+        # Handle assets
+        location /assets/ {
+            alias /var/www/html/assets/;
+            expires 1y;
+            add_header Cache-Control "public";
+            try_files $uri $uri/ =404;
+        }
+
+        # Handle themes
+        location /themes/ {
+            alias /var/www/html/themes/;
+            expires 1y;
+            add_header Cache-Control "public";
+            try_files $uri $uri/ =404;
+        }
+
+        # Security - deny access to sensitive directories
+        location ~ /\.ht {
+            deny all;
+        }
+
+        # Cache static files
+        location ~* \.(css|js|png|jpg|jpeg|gif|ico|woff|woff2|ttf|svg|eot|mp4|webm|ogg)$ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+            try_files $uri $uri/ =404;
+        }
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wowonder-php-config
+  namespace: wowonder
+data:
+  custom.ini: |
+    file_uploads = On
+    post_max_size = 2024M
+    upload_max_filesize = 2024M
+    output_buffering = Off
+    max_execution_time = 4000
+    max_input_vars = 3000
+    max_input_time = 5000
+    memory_limit = 400M
+    zlib.output_compression = Off
+    display_errors = Off
+    log_errors = On
+    error_log = /var/log/php_errors.log
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wowonder-laravel
+  namespace: wowonder
+  labels:
+    app: wowonder-laravel
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wowonder-laravel
+  template:
+    metadata:
+      labels:
+        app: wowonder-laravel
+    spec:
+      initContainers:
+      - name: setup-permissions
+        image: busybox:1.35
+        command: ['sh', '-c', '
+          echo "Setting up directories and permissions..." &&
+          mkdir -p /var/www/html/upload /var/www/html/cache /var/www/html/admin-panel &&
+          chown -R 82:82 /var/www/html &&
+          chmod -R 755 /var/www/html/upload &&
+          chmod -R 755 /var/www/html/cache &&
+          chmod -R 755 /var/www/html/admin-panel &&
+          echo "Permissions setup completed"
+        ']
+        volumeMounts:
+        - name: upload-storage
+          mountPath: /var/www/html/upload
+        - name: cache-storage
+          mountPath: /var/www/html/cache
+        - name: app-data
+          mountPath: /var/www/html
+      containers:
+      - name: wowonder-laravel
+        image: YOUR_DOCKERHUB_USERNAME/wowonder-laravel:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 80
+          name: http
+        env:
+        - name: DB_HOST
+          value: "mysql-service"
+        - name: DB_DATABASE
+          value: "wowonderdb"
+        - name: DB_USERNAME
+          value: "wowonderuser"
+        - name: DB_PASSWORD
+          value: "Password123@24"
+        - name: APP_URL
+          value: "http://44.220.139.238:30080"
+        - name: APP_DEBUG
+          value: "false"
+        volumeMounts:
+        - name: upload-storage
+          mountPath: /var/www/html/upload
+        - name: cache-storage
+          mountPath: /var/www/html/cache
+        - name: nginx-config
+          mountPath: /etc/nginx/conf.d/default.conf
+          subPath: default.conf
+        - name: php-config
+          mountPath: /usr/local/etc/php/conf.d/custom.ini
+          subPath: custom.ini
+        - name: app-data
+          mountPath: /var/www/html
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+            httpHeaders:
+            - name: Host
+              value: localhost
+          initialDelaySeconds: 90
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+            httpHeaders:
+            - name: Host
+              value: localhost
+          initialDelaySeconds: 60
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+      volumes:
+      - name: upload-storage
+        persistentVolumeClaim:
+          claimName: laravel-uploads-pvc
+      - name: cache-storage
+        emptyDir: {}
+      - name: nginx-config
+        configMap:
+          name: wowonder-nginx-config
+      - name: php-config
+        configMap:
+          name: wowonder-php-config
+      - name: app-data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wowonder-service
+  namespace: wowonder
+  labels:
+    app: wowonder-laravel
+spec:
+  type: NodePort
+  ports:
+  - port: 80
+    targetPort: 80
+    nodePort: 30080
+    protocol: TCP
+    name: http
+  selector:
+    app: wowonder-laravel

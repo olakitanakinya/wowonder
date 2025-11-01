@@ -1,0 +1,8 @@
+{
+    "sql_db_host": "localhost",
+    "sql_db_user": "fadcmkvb_wowonderuser",
+    "sql_db_pass": "Password123@24",
+    "sql_db_name": "fadcmkvb_wowonderdb",
+    "site_url": "https://wowonder.fadcgroup.org",
+    "purchase_code": "000000"
+}
