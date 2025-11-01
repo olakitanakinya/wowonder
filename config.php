@@ -20,7 +20,7 @@ $sql_db_name = "wowonderdb";
 // Site URL
 $site_url = "http://44.220.139.238:30080"; // e.g (http://example.com)
 
-$auto_redirect = true;
+$auto_redirect = false;
 
 // Purchase code
 $purchase_code = "000000"; // Your purchase code, don't give it to anyone.
