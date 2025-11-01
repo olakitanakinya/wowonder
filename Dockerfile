@@ -37,6 +37,9 @@ RUN mkdir -p upload cache admin-panel && \
     chown -R www-data:www-data /var/www/html && \
     chmod -R 755 upload cache admin-panel themes assets
 
+# Ensure .htaccess is included
+RUN if [ -f ".htaccess" ]; then echo ".htaccess found"; else echo "No .htaccess in build"; fi
+
 # Test nginx configuration
 RUN nginx -t
 

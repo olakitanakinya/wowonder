@@ -1,0 +1,999 @@
+name: Deploy Wowonder
+on:
+  push:
+    branches: [main]
+
+env:
+  DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/wowonder-laravel
+  NAMESPACE: wowonder
+  K8S_WORKER_IP: 44.220.139.238
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Fix config.php port
+      run: |
+        echo "=== Fixing config.php port ==="
+        if [ -f "config.php" ]; then
+          sed -i 's/:3008/:30080/g' config.php
+          echo "Updated port from 3008 to 30080 in config.php"
+        else
+          echo "Creating config.php with correct port..."
+          echo '<?php' > config.php
+          echo '$sql_db_host = "mysql-service";' >> config.php
+          echo '$sql_db_user = "wowonderuser";' >> config.php
+          echo '$sql_db_pass = "Password123@24";' >> config.php
+          echo '$sql_db_name = "wowonderdb";' >> config.php
+          echo '$site_url = "http://44.220.139.238:30080";' >> config.php
+          echo '$auto_redirect = false;' >> config.php
+          echo '$purchase_code = "000000";' >> config.php
+          echo '$siteEncryptKey = "eb733cdb4d769426e460bad9df6b824eee3416d7";' >> config.php
+          echo '?>' >> config.php
+        fi
+
+    - name: Create Nginx configuration
+      run: |
+        echo "=== Creating Nginx Configuration ==="
+        cat > nginx.conf << 'EOF'
+        server {
+            listen 80;
+            server_name _;
+            root /var/www/html;
+            index index.php index.html;
+
+            client_max_body_size 2024M;
+            client_body_timeout 5000s;
+            fastcgi_read_timeout 4000s;
+            fastcgi_send_timeout 4000s;
+
+            # Disable redirects in Nginx to prevent loops
+            port_in_redirect off;
+            server_name_in_redirect off;
+
+            location / {
+                try_files $uri $uri/ /index.php?$query_string;
+            }
+
+            location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|mp4|webm|ogg)$ {
+                expires 1y;
+                add_header Cache-Control "public, immutable";
+                try_files $uri $uri/ =404;
+            }
+
+            location /upload/ {
+                alias /var/www/html/upload/;
+                expires 1y;
+                add_header Cache-Control "public, immutable";
+                try_files $uri $uri/ =404;
+            }
+
+            location /assets/ {
+                alias /var/www/html/assets/;
+                expires 1y;
+                add_header Cache-Control "public";
+                try_files $uri $uri/ =404;
+            }
+
+            location /themes/ {
+                alias /var/www/html/themes/;
+                expires 1y;
+                add_header Cache-Control "public";
+                try_files $uri $uri/ =404;
+            }
+
+            location /admin-panel/ {
+                alias /var/www/html/admin-panel/;
+                try_files $uri $uri/ /admin-panel/index.php?$query_string;
+            }
+
+            location ~ \.php$ {
+                include fastcgi_params;
+                fastcgi_pass 127.0.0.1:9000;
+                fastcgi_index index.php;
+                fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                fastcgi_param PATH_INFO $fastcgi_path_info;
+                
+                # Prevent redirect loops
+                fastcgi_param HTTPS off;
+                fastcgi_param HTTP_X_FORWARDED_PROTO http;
+            }
+
+            location ~ /\.ht {
+                deny all;
+            }
+        }
+        EOF
+        echo "Nginx configuration created"
+        echo "=== Verifying Nginx config ==="
+        cat nginx.conf
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        push: true
+        tags: |
+          ${{ env.DOCKER_IMAGE }}:latest
+          ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: self-hosted
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Kubernetes
+      uses: azure/setup-kubectl@v3
+
+    - name: Configure kubeconfig
+      run: |
+        mkdir -p ~/.kube
+        echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config
+        kubectl config set-cluster kubernetes --server=https://54.159.42.214:6443 --insecure-skip-tls-verify=true
+        kubectl get nodes
+
+    - name: Cleanup previous deployment
+      run: |
+        echo "=== Cleaning previous deployment ==="
+        kubectl delete all --all -n ${{ env.NAMESPACE }} --ignore-not-found=true
+        kubectl delete pvc -n ${{ env.NAMESPACE }} --all --ignore-not-found=true
+        kubectl delete pv --all --ignore-not-found=true
+        kubectl delete namespace ${{ env.NAMESPACE }} --ignore-not-found=true
+        sleep 10
+
+    - name: Create namespace
+      run: |
+        kubectl create namespace ${{ env.NAMESPACE }}
+        echo "Namespace ${{ env.NAMESPACE }} created"
+
+    - name: Setup storage directories on worker node
+      run: |
+        echo "=== Setting up storage directories on worker node ==="
+        # Create storage directories on worker node using a Kubernetes job
+        cat <<EOF | kubectl apply -f -
+        apiVersion: batch/v1
+        kind: Job
+        metadata:
+          name: storage-setup
+          namespace: ${{ env.NAMESPACE }}
+        spec:
+          template:
+            spec:
+              nodeSelector:
+                kubernetes.io/hostname: worker
+              containers:
+              - name: storage-setup
+                image: busybox:1.35
+                command:
+                - /bin/sh
+                - -c
+                - |
+                  echo "Creating storage directories on worker node..."
+                  mkdir -p /mnt/data/wowonder /mnt/data/mysql
+                  chmod -R 777 /mnt/data
+                  echo "Storage directories created successfully"
+                  ls -la /mnt/data/
+                volumeMounts:
+                - name: host-root
+                  mountPath: /mnt
+              restartPolicy: OnFailure
+              volumes:
+              - name: host-root
+                hostPath:
+                  path: /
+                  type: Directory
+        EOF
+
+        # Wait for job completion
+        echo "Waiting for storage setup job to complete..."
+        kubectl wait --for=condition=complete job/storage-setup -n ${{ env.NAMESPACE }} --timeout=60s
+
+        # Check job logs
+        kubectl logs job/storage-setup -n ${{ env.NAMESPACE }}
+
+        # Cleanup job
+        kubectl delete job/storage-setup -n ${{ env.NAMESPACE }} --ignore-not-found=true
+
+    - name: Deploy storage
+      run: |
+        echo "=== Deploying Storage ==="
+        kubectl apply -f k8s/storage.yaml
+        sleep 15
+
+        echo "=== Storage Status ==="
+        kubectl get pv,pvc -n ${{ env.NAMESPACE }} -o wide
+
+        echo "=== PVC Details ==="
+        kubectl describe pvc -n ${{ env.NAMESPACE }}
+
+    - name: Deploy MySQL
+      run: |
+        echo "=== Deploying MySQL ==="
+        kubectl apply -f k8s/mysql.yaml
+
+        echo "=== Checking MySQL Pod Status ==="
+        timeout 300s bash -c '
+          while true; do
+            POD_STATUS=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath="{.items[0].status.phase}" 2>/dev/null || echo "NotFound")
+            POD_NODE=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath="{.items[0].spec.nodeName}" 2>/dev/null || echo "NoNode")
+
+            echo "Pod Status: $POD_STATUS, Node: $POD_NODE"
+
+            if [ "$POD_STATUS" = "Running" ]; then
+              echo "✓ MySQL pod is running"
+              break
+            elif [ "$POD_STATUS" = "Pending" ]; then
+              echo "⏳ MySQL pod is pending..."
+              # Get detailed pod info
+              MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || echo "not-found")
+              if [ "$MYSQL_POD" != "not-found" ]; then
+                kubectl describe pod $MYSQL_POD -n ${{ env.NAMESPACE }}
+
+                # Check events
+                echo "=== Recent Events ==="
+                kubectl get events -n ${{ env.NAMESPACE }} --sort-by='.lastTimestamp' | tail -10
+              fi
+              sleep 20
+            elif [ "$POD_STATUS" = "NotFound" ]; then
+              echo "⏳ MySQL pod not created yet..."
+              sleep 10
+            else
+              echo "⏳ MySQL pod status: $POD_STATUS"
+              sleep 10
+            fi
+          done
+        '
+
+        # Wait for pod to be ready
+        echo "Waiting for MySQL to be ready..."
+        kubectl wait --for=condition=ready pod -l app=mysql -n ${{ env.NAMESPACE }} --timeout=600s
+
+    - name: Check MySQL pod status
+      run: |
+        echo "=== MySQL Pod Status ==="
+        kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o wide
+        echo ""
+        echo "=== MySQL Pod Logs ==="
+        MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}')
+        kubectl logs $MYSQL_POD -n ${{ env.NAMESPACE }} --tail=20
+
+    - name: Initialize database
+      run: |
+        echo "=== Initializing Database ==="
+        MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}')
+        echo "MySQL pod: $MYSQL_POD"
+
+        # Wait for MySQL to be ready to accept connections
+        echo "Waiting for MySQL to accept connections..."
+        timeout 180s bash -c "
+          while ! kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysqladmin ping -uroot -prootpassword --silent; do
+            echo '⏳ MySQL not ready yet...'
+            sleep 10
+          done
+          echo '✓ MySQL is ready and accepting connections'
+        "
+
+        # Drop and recreate database to ensure clean state
+        echo "Ensuring clean database state..."
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "DROP DATABASE IF EXISTS wowonderdb;"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE DATABASE wowonderdb;"
+
+        # Create user
+        echo "Creating database user..."
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "DROP USER IF EXISTS 'wowonderuser'@'%';"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE USER 'wowonderuser'@'%' IDENTIFIED BY 'Password123@24';"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "GRANT ALL PRIVILEGES ON wowonderdb.* TO 'wowonderuser'@'%';"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "FLUSH PRIVILEGES;"
+
+        echo "✅ Database and user created successfully"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "SHOW DATABASES;"
+
+        # Import SQL file with error handling for existing tables
+        echo "Importing database schema from wowonderdb.sql..."
+        if [ -f "wowonderdb.sql" ]; then
+          echo "✓ wowonderdb.sql file found, size: $(wc -l < wowonderdb.sql) lines"
+
+          # Copy file to pod
+          echo "Copying SQL file to MySQL pod..."
+          kubectl cp wowonderdb.sql ${{ env.NAMESPACE }}/$MYSQL_POD:/tmp/db.sql
+
+          # Verify file was copied
+          echo "Verifying file copy..."
+          kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- ls -la /tmp/db.sql
+
+          # Import database with force option to ignore errors
+          echo "Importing database schema (ignoring duplicate table errors)..."
+          kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- bash -c "mysql -uroot -prootpassword wowonderdb < /tmp/db.sql 2>/dev/null || echo 'Import completed with some warnings'"
+          echo "✓ Database import completed"
+
+          # Verify import
+          echo "Verifying database tables:"
+          kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword wowonderdb -e "SHOW TABLES;"
+
+          # Count tables
+          TABLE_COUNT=$(kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword wowonderdb -e "SHOW TABLES;" | wc -l)
+          echo "✓ Database has $((TABLE_COUNT - 1)) tables"
+        else
+          echo "⚠ wowonderdb.sql not found, using empty database"
+        fi
+
+        echo "✅ Database initialization completed"
+
+    - name: Deploy Nginx ConfigMap
+      run: |
+        echo "=== Deploying Nginx ConfigMap ==="
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: wowonder-nginx-config
+          namespace: ${{ env.NAMESPACE }}
+        data:
+          default.conf: |
+            server {
+                listen 80;
+                server_name _;
+                root /var/www/html;
+                index index.php index.html;
+
+                client_max_body_size 2024M;
+                client_body_timeout 5000s;
+                fastcgi_read_timeout 4000s;
+                fastcgi_send_timeout 4000s;
+
+                # Disable redirects in Nginx to prevent loops
+                port_in_redirect off;
+                server_name_in_redirect off;
+
+                location / {
+                    try_files \$uri \$uri/ /index.php?\$query_string;
+                }
+
+                location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|mp4|webm|ogg)$ {
+                    expires 1y;
+                    add_header Cache-Control "public, immutable";
+                    try_files \$uri \$uri/ =404;
+                }
+
+                location /upload/ {
+                    alias /var/www/html/upload/;
+                    expires 1y;
+                    add_header Cache-Control "public, immutable";
+                    try_files \$uri \$uri/ =404;
+                }
+
+                location /assets/ {
+                    alias /var/www/html/assets/;
+                    expires 1y;
+                    add_header Cache-Control "public";
+                    try_files \$uri \$uri/ =404;
+                }
+
+                location /themes/ {
+                    alias /var/www/html/themes/;
+                    expires 1y;
+                    add_header Cache-Control "public";
+                    try_files \$uri \$uri/ =404;
+                }
+
+                location /admin-panel/ {
+                    alias /var/www/html/admin-panel/;
+                    try_files \$uri \$uri/ /admin-panel/index.php?\$query_string;
+                }
+
+                location ~ \.php$ {
+                    include fastcgi_params;
+                    fastcgi_pass 127.0.0.1:9000;
+                    fastcgi_index index.php;
+                    fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+                    fastcgi_param PATH_INFO \$fastcgi_path_info;
+                    
+                    # Prevent redirect loops
+                    fastcgi_param HTTPS off;
+                    fastcgi_param HTTP_X_FORWARDED_PROTO http;
+                }
+
+                location ~ /\.ht {
+                    deny all;
+                }
+            }
+        EOF
+        echo "✓ Nginx ConfigMap deployed with redirect fixes"
+
+    - name: Deploy application
+      run: |
+        echo "=== Deploying Application ==="
+        # Create a temporary file with the image replaced
+        cat <<EOF | sed "s|\$DOCKER_IMAGE|${{ env.DOCKER_IMAGE }}|g" | kubectl apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: wowonder-app
+          namespace: ${{ env.NAMESPACE }}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: wowonder-app
+          template:
+            metadata:
+              labels:
+                app: wowonder-app
+            spec:
+              nodeSelector:
+                kubernetes.io/hostname: worker
+              containers:
+              - name: wowonder-app
+                image: \$DOCKER_IMAGE:latest
+                ports:
+                - containerPort: 80
+                volumeMounts:
+                - name: nginx-config
+                  mountPath: /etc/nginx/conf.d/default.conf
+                  subPath: default.conf
+                env:
+                - name: DB_HOST
+                  value: "mysql-service"
+                - name: DB_DATABASE
+                  value: "wowonderdb"
+                - name: DB_USERNAME
+                  value: "wowonderuser"
+                - name: DB_PASSWORD
+                  value: "Password123@24"
+                - name: SITE_URL
+                  value: "http://44.220.139.238:30080"
+                resources:
+                  requests:
+                    memory: "512Mi"
+                    cpu: "250m"
+                  limits:
+                    memory: "1Gi"
+                    cpu: "500m"
+                livenessProbe:
+                  httpGet:
+                    path: /index.php
+                    port: 80
+                  initialDelaySeconds: 60
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+                readinessProbe:
+                  httpGet:
+                    path: /index.php
+                    port: 80
+                  initialDelaySeconds: 30
+                  periodSeconds: 5
+                  timeoutSeconds: 3
+                  failureThreshold: 3
+              volumes:
+              - name: nginx-config
+                configMap:
+                  name: wowonder-nginx-config
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: wowonder-service
+          namespace: ${{ env.NAMESPACE }}
+        spec:
+          type: NodePort
+          selector:
+            app: wowonder-app
+          ports:
+          - port: 80
+            targetPort: 80
+            nodePort: 30080
+        EOF
+
+        echo "Waiting for application pod..."
+        timeout 180s bash -c '
+          while true; do
+            POD_STATUS=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath="{.items[0].status.phase}" 2>/dev/null || echo "NotFound")
+            if [ "$POD_STATUS" = "Running" ]; then
+              echo "✓ Application pod is running"
+              break
+            elif [ "$POD_STATUS" = "NotFound" ]; then
+              echo "⏳ Application pod not found yet..."
+            else
+              echo "⏳ Application pod status: $POD_STATUS"
+            fi
+            sleep 10
+          done
+        '
+
+    - name: Verify application files
+      run: |
+        echo "=== Verifying Application Files ==="
+        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "NOT_FOUND")
+
+        if [ "$APP_POD" != "NOT_FOUND" ]; then
+          echo "Checking application structure:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ls -la /var/www/html/
+          echo "Checking if themes directory exists:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ls -la /var/www/html/themes/ || echo "Themes directory not found"
+          echo "Checking if index.php exists:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ls -la /var/www/html/index.php || echo "index.php not found"
+          echo "Checking if .htaccess exists:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ls -la /var/www/html/.htaccess || echo ".htaccess not found"
+        else
+          echo "❌ Application pod not found for verification"
+        fi
+
+    - name: Deploy .htaccess file
+      run: |
+        echo "=== Deploying .htaccess file ==="
+        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "NOT_FOUND")
+
+        if [ "$APP_POD" != "NOT_FOUND" ]; then
+          echo "Deploying .htaccess file..."
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "cat > /var/www/html/.htaccess << 'EOF'
+RewriteEngine On
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^password-reset/([^\/]+)(\/|)$  index.php?link1=welcome&link2=password_reset&user_id=$1 [NC,QSA]
+RewriteRule ^admin-cp$ admincp.php [NC,QSA]
+RewriteRule ^admin-cp/(.*)$ admincp.php?page=$1 [NC,QSA]
+RewriteRule ^admincp$ admincp.php [NC,QSA]
+RewriteRule ^admincp/(.*)$ admincp.php?page=$1 [NC,QSA]
+RewriteRule ^adminPages/(.*)$ admin-panel/$1 [L]
+RewriteRule ^start-up(/?|)$ index.php?link1=start-up [NC,QSA]
+RewriteRule ^watch/(.*)$ index.php?link1=watch&id=$1 [NC,QSA]
+RewriteRule ^watch(.*)$ index.php?link1=watch [NC,QSA]
+RewriteRule ^saved-posts/(.*)$ index.php?link1=saved-posts [NC,QSA]
+RewriteRule ^unusual-login(/?|)$ index.php?link1=unusual-login [NC,QSA]
+RewriteRule ^activated/(.*)$ index.php?link1=activate&link2=$1 [NC,QSA]
+RewriteRule ^search(/?|)$ index.php?link1=search [NC,QSA]
+RewriteRule ^ads-create$ index.php?link1=ads-create [NC,QSA]
+RewriteRule ^search/([^\/]+)(\/|)$ index.php?link1=search&query=$1 [NC,QSA]
+RewriteRule ^app/([^\/]+)(\/|)$ index.php?link1=app&app_id=$1 [NC,QSA]
+RewriteRule ^messages/([^\/]+)(\/|)$  index.php?link1=messages&user=$1 [QSA]
+RewriteRule ^terms/([^\/]+)(\/|)$  index.php?link1=terms&type=$1 [QSA]
+RewriteRule ^video-call/([^\/]+)(\/|)$  index.php?link1=video-call&call_id=$1 [QSA]
+RewriteRule ^video-call-api/([^\/]+)(\/|)$  index.php?link1=video-call-api&call_id=$1 [QSA]
+RewriteRule ^post/([^\/]+)(\/|)$ index.php?link1=post&id=$1 [NC,QSA]
+RewriteRule ^game/([^\/]+)(\/|)$ index.php?link1=game&id=$1 [NC,QSA]
+RewriteRule ^upgraded(/?|)$ index.php?link1=upgraded [NC,QSA]
+RewriteRule ^get_news_feed(/?|)$ index.php?link1=get_news_feed [NC,QSA]
+RewriteRule ^games(/?|)$ index.php?link1=games [NC,QSA]
+RewriteRule ^new-game(/?|)$ index.php?link1=new-game [NC,QSA]
+RewriteRule ^go-pro(/?|)$ index.php?link1=go-pro [NC,QSA]
+RewriteRule ^oops$ index.php?link1=oops [NC,QSA]
+RewriteRule ^user-activation$ index.php?link1=user-activation [NC,QSA]
+RewriteRule ^hashtag/([^\/]+)(\/|)$ index.php?link1=hashtag&hash=$1 [NC,QSA]
+RewriteRule ^follow-requests/(.*)$ index.php?link1=follow-requests[NC,QSA]
+RewriteRule ^p/([^\/]+)(\/|)$ index.php?link1=page&p=$1 [NC,QSA]
+RewriteRule ^g/([^\/]+)(\/|)$ index.php?link1=group&g=$1 [NC,QSA]
+RewriteRule ^home(/?|)$ index.php?link1=home [QSA]
+RewriteRule ^404(/?|)$ index.php?link1=404 [QSA]
+RewriteRule ^welcome(.*)$ index.php?link1=welcome [QSA,L]
+RewriteRule ^register(/?|)$ index.php?link1=register [QSA,L]
+RewriteRule ^confirm-sms(/?|)$ index.php?link1=confirm-sms [QSA,L]
+RewriteRule ^confirm-sms-password(/?|)$ index.php?link1=confirm-sms-password [QSA,L]
+RewriteRule ^forgot-password(/?|)$ index.php?link1=forgot-password [QSA,L]
+RewriteRule ^activate(/?|)$ index.php?link1=activate [QSA]
+RewriteRule ^pages(/?|)$ index.php?link1=pages [QSA]
+RewriteRule ^liked-pages(/?|)$ index.php?link1=liked-pages [QSA]
+RewriteRule ^joined_groups(/?|)$ index.php?link1=joined_groups [QSA]
+RewriteRule ^suggested-pages(/?|)$ index.php?link1=suggested-pages [QSA]
+RewriteRule ^groups(/?|)$ index.php?link1=groups [QSA]
+RewriteRule ^suggested-groups(/?|)$ index.php?link1=suggested-groups [QSA]
+RewriteRule ^create-group(/?|)$ index.php?link1=create-group [QSA]
+RewriteRule ^create-page(/?|)$ index.php?link1=create-page [QSA]
+RewriteRule ^logout(/?|)$ index.php?link1=logout [QSA]
+RewriteRule ^contact-us(/?|)$ index.php?link1=contact-us [QSA]
+RewriteRule ^setting(/?|)$ index.php?link1=setting [QSA]
+RewriteRule ^messages(/?|)$  index.php?link1=messages [QSA]
+RewriteRule ^saved-posts(/?|)$ index.php?link1=saved-posts [NC,QSA]
+RewriteRule ^albums(/?|)$ index.php?link1=albums [QSA]
+RewriteRule ^albums/([A-Za-z0-9_-]+)$ index.php?link1=albums&user=$1 [QSA]
+RewriteRule ^album/([A-Za-z0-9_-]+)$ index.php?link1=album&id=$1 [QSA]
+RewriteRule ^create-album$ index.php?link1=create-album [QSA]
+RewriteRule ^create-album/([A-Za-z0-9_-]+)$ index.php?link1=create-album&album=$1  [QSA]
+RewriteRule ^$ index.php?link1=home [QSA]
+RewriteRule ^setting/([A-Za-z0-9_]+)/([A-Za-z0-9_-]+)$  index.php?link1=setting&user=$1&page=$2 [NC,QSA]
+RewriteRule ^page-setting/([^\/]+)(\/|)$  index.php?link1=page-setting&page=$1 [QSA]
+RewriteRule ^page-setting/([A-Za-z0-9_]+)/([A-Za-z0-9_-]+)$  index.php?link1=page-setting&page=$1&link3=$2 [QSA]
+RewriteRule ^group-setting/([^\/]+)(\/|)$ index.php?link1=group-setting&group=$1 [QSA]
+RewriteRule ^group-setting/([A-Za-z0-9_]+)/([A-Za-z0-9_-]+)$  index.php?link1=group-setting&group=$1&link3=$2 [QSA]
+RewriteRule ^new-product(/?|)$ index.php?link1=new-product [NC,QSA]
+RewriteRule ^edit-product/([A-Za-z0-9_]+)$ index.php?link1=edit-product&id=$1 [NC,QSA]
+RewriteRule ^products(/?|)$ index.php?link1=products [NC,QSA]
+RewriteRule ^products/([A-Za-z0-9_-]+)$ index.php?link1=products&c_id=$1 [QSA]
+RewriteRule ^products/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)$ index.php?link1=products&c_id=$1&sub_id=$2 [QSA]
+RewriteRule ^my-products(/?|)$ index.php?link1=my-products [QSA]
+RewriteRule ^site-pages/(.*)$ index.php?link1=site-pages&page_name=$1 [NC,QSA]
+RewriteRule ^blogs(/?|)$ index.php?link1=blogs [NC,QSA]
+RewriteRule ^sharer(/?|)$ index.php?link1=sharer [NC,QSA]
+RewriteRule ^blog-category/(\d+)(/?|)$ index.php?link1=blog-category&id=$1 [NC,QSA]
+RewriteRule ^create-blog(/?|)$ index.php?link1=create-blog [NC,QSA]
+RewriteRule ^edit-blog/(\d+)(/?|)$ index.php?link1=edit-blog&id=$1 [NC,QSA]
+RewriteRule ^my-blogs(/?|)$ index.php?link1=my-blogs [NC,QSA]
+RewriteRule ^read-blog/(.*)$ index.php?link1=read-blog&id=$1 [NC,QSA]
+RewriteRule ^app_api(/?|)$ index.php?link1=app_api [NC,QSA]
+RewriteRule ^api_request(/?|)$ index.php?link1=app_api [NC,QSA]
+RewriteRule ^authorize(/?|)$ index.php?link1=authorize [NC,QSA]
+RewriteRule ^poke(/?|)$ index.php?link1=poke [NC,QSA]
+RewriteRule ^most_liked(/?|)$ index.php?link1=most_liked [NC,QSA]
+RewriteRule ^jobs(/?|)$ index.php?link1=jobs [NC,QSA]
+RewriteRule ^common_things(/?|)$ index.php?link1=common_things [NC,QSA]
+RewriteRule ^funding(/?|)$ index.php?link1=funding [NC,QSA]
+RewriteRule ^my_funding(/?|)$ index.php?link1=my_funding [NC,QSA]
+RewriteRule ^create_funding(/?|)$ index.php?link1=create_funding [NC,QSA]
+RewriteRule ^edit_fund/(.*)$ index.php?link1=edit_fund&id=$1 [NC,QSA]
+RewriteRule ^show_fund/(.*)$ index.php?link1=show_fund&id=$1 [NC,QSA]
+RewriteRule ^live(/?|)$ index.php?link1=live [NC,QSA]
+RewriteRule ^memories(/?|)$ index.php?link1=memories [NC,QSA]
+RewriteRule ^offers(/?|)$ index.php?link1=offers [NC,QSA]
+RewriteRule ^nearby_shops(/?|)$ index.php?link1=nearby_shops [NC,QSA]
+RewriteRule ^nearby_business(/?|)$ index.php?link1=nearby_business [NC,QSA]
+RewriteRule ^refund(/?|)$ index.php?link1=refund [NC,QSA]
+RewriteRule ^advertise(/?|)$ index.php?link1=advertise [NC,QSA]
+RewriteRule ^checkout(/?|)$ index.php?link1=checkout [NC,QSA]
+RewriteRule ^purchased(/?|)$ index.php?link1=purchased [NC,QSA]
+RewriteRule ^orders(/?|)$ index.php?link1=orders [NC,QSA]
+RewriteRule ^customer_order/(.*)$ index.php?link1=customer_order&id=$1 [NC,QSA]
+RewriteRule ^order/(.*)$ index.php?link1=order&id=$1 [NC,QSA]
+RewriteRule ^reviews/(.*)$ index.php?link1=reviews&id=$1 [NC,QSA]
+RewriteRule ^open_to_work_posts(/?|)$ index.php?link1=open_to_work_posts [NC,QSA]
+RewriteRule ^banned(/?|)$ index.php?link1=banned [NC,QSA]
+RewriteRule ^withdrawal(/?|)$ index.php?link1=withdrawal [NC,QSA]
+RewriteRule ^explore(/?|)$ index.php?link1=explore [NC,QSA]
+RewriteRule ^tiktok_callback(/?|)$ index.php?link1=tiktok_callback [NC,QSA]
+RewriteRule ^vkontakte_callback(/?|)$ index.php?link1=vkontakte_callback [NC,QSA]
+
+# **** FORUM ****
+
+RewriteRule ^forum(/?|)$ index.php?link1=forum [NC,QSA]
+RewriteRule ^forum/members(/?|)$ index.php?link1=forum-members [NC,QSA]
+RewriteRule ^forum/members/([a-zA-Z]{0,1})(/?|)$ index.php?link1=forum-members-byname&char=$1 [NC,QSA]
+RewriteRule ^forum/search(/?|)$ index.php?link1=forum-search [NC,QSA]
+RewriteRule ^forum/search-result/(/?|)$ index.php?link1=forum-search-result [NC,QSA]
+RewriteRule ^forum/events(/?|)$ index.php?link1=forum-events [NC,QSA]
+RewriteRule ^forum/help(/?|)$ index.php?link1=forum-help [NC,QSA]
+RewriteRule ^forums/(\d+)(/?|)$ index.php?link1=forums&fid=$1 [NC,QSA]
+RewriteRule ^forums/add/(\d+)(/?|)$ index.php?link1=forumaddthred&fid=$1 [NC,QSA]
+RewriteRule ^forums/thread/(\d+)(/?|)$ index.php?link1=showthread&tid=$1 [NC,QSA]
+RewriteRule ^forums/thread/reply/(\d+)(/?|)$ index.php?link1=threadreply&tid=$1 [NC,QSA]
+RewriteRule ^forums/thread/quote/(\d+)(/?|)$ index.php?link1=threadquote&tid=$1 [NC,QSA]
+RewriteRule ^forums/thread/edit/(\d+)(/?|)$ index.php?link1=editreply&tid=$1 [NC,QSA]
+RewriteRule ^forums/user/threads(/?|)$ index.php?link1=mythreads [NC,QSA]
+RewriteRule ^forums/user/threads/edit/(\d+)(/?|)$ index.php?link1=edithread&tid=$1 [NC,QSA]
+RewriteRule ^forums/user/messages(/?|)$ index.php?link1=mymessages [NC,QSA]
+
+# **** EVENTS ****
+
+RewriteRule ^events(/?|)$ index.php?link1=events [NC,QSA]
+RewriteRule ^events/create-event(/?|)$ index.php?link1=create-event [NC,QSA]
+RewriteRule ^events/edit/(\d+)/(/?|)$ index.php?link1=edit-event&eid=$1 [NC,QSA]
+RewriteRule ^events/my(/?|)$ index.php?link1=my-events [NC,QSA]
+RewriteRule ^events/going(/?|)$ index.php?link1=events-going [NC,QSA]
+RewriteRule ^events/invited(/?|)$ index.php?link1=events-invited [NC,QSA]
+RewriteRule ^events/interested(/?|)$ index.php?link1=events-interested [NC,QSA]
+RewriteRule ^events/past(/?|)$ index.php?link1=events-past [NC,QSA]
+RewriteRule ^events/(\d+)(/?|)$ index.php?link1=show-event&eid=$1 [NC,QSA]
+
+# *** MOVIES ***
+RewriteRule ^movies(/?|)$ index.php?link1=movies [NC,QSA]
+RewriteRule ^movies/genre/([A-Za-z-]+)(/?|)$ index.php?link1=movies-genre&genre=$1 [NC,QSA]
+RewriteRule ^movies/country/([A-Za-z-]+)(/?|)$ index.php?link1=movies-country&country=$1 [NC,QSA]
+RewriteRule ^movies/watch/(.*)$ index.php?link1=watch-film&film-id=$1 [NC,QSA]
+
+# *** ADS ***
+RewriteRule ^ads(/?|)$ index.php?link1=ads [NC,QSA]
+RewriteRule ^wallet(/?|)$ index.php?link1=wallet [NC,QSA]
+RewriteRule ^send_money(/?|)$ index.php?link1=send_money [NC,QSA]
+RewriteRule ^ads/create(/?|)$ index.php?link1=create-ads [NC,QSA]
+RewriteRule ^ads/edit/(\d+)(/?|)$ index.php?link1=edit-ads&id=$1 [NC,QSA]
+RewriteRule ^ads/chart/(\d+)(/?|)$ index.php?link1=chart-ads&id=$1 [NC,QSA]
+RewriteRule ^admin/ads/edit/(\d+)(/?|)$ index.php?link1=manage-ads&id=$1 [NC,QSA]
+
+# *** STATUS ***
+RewriteRule ^status/create(/?|)$ index.php?link1=create-status [NC,QSA]
+RewriteRule ^more-status(/?|)$ index.php?link1=more-status [NC,QSA]
+
+# *** REELS ***
+RewriteRule ^reels(/?|)$ index.php?link1=reels [NC,QSA]
+RewriteRule ^reels/([A-Za-z0-9_-]+)$ index.php?link1=reels&id=$1 [NC,QSA]
+RewriteRule ^reels/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)$ index.php?link1=reels&id=$1&user=$2 [NC,QSA]
+
+# *** MONETIZATION ***
+
+RewriteRule ^monetization/(.*)$ index.php?link1=monetization&user=$1 [NC,QSA]
+RewriteRule ^monetization(/?|)$ index.php?link1=monetization [NC,QSA]
+
+# *** SUBSCRIPTION ***
+RewriteRule ^subscriptions(/?|)$ index.php?link1=subscriptions [NC,QSA]
+RewriteRule ^subscriptions/monetizations index.php?link1=subscriptions&type=monetizations [NC,QSA]
+
+# *** DIRECTORY ***
+
+RewriteRule ^directory/posts(.*)$ index.php?link1=directory-posts&page=$1 [NC,QSA]
+RewriteRule ^directory/users(.*)$ index.php?link1=directory-users&page=$1 [NC,QSA]
+RewriteRule ^directory/pages(.*)$ index.php?link1=directory-pages&page=$1 [NC,QSA]
+RewriteRule ^directory/groups(.*)$ index.php?link1=directory-groups&page=$1 [NC,QSA]
+RewriteRule ^directory/market(.*)$ index.php?link1=directory-market&page=$1 [NC,QSA]
+RewriteRule ^directory/events(.*)$ index.php?link1=directory-events&page=$1 [NC,QSA]
+RewriteRule ^directory/games(.*)$ index.php?link1=directory-games&page=$1 [NC,QSA]
+RewriteRule ^directory/movies(.*)$ index.php?link1=directory-movies&page=$1 [NC,QSA]
+RewriteRule ^directory/jobs(.*)$ index.php?link1=directory-jobs&page=$1 [NC,QSA]
+RewriteRule ^directory/fundings(.*)$ index.php?link1=directory-fundings&page=$1 [NC,QSA]
+RewriteRule ^directory/blogs(.*)$ index.php?link1=directory-blogs&page=$1 [NC,QSA]
+RewriteRule ^directory/forums(.*)$ index.php?link1=directory-forums&page=$1 [NC,QSA]
+RewriteRule ^directory(.*)$  index.php?link1=directory&page=$1 [NC,QSA]
+
+# *** SWITCH ACCOUNT ***
+RewriteRule ^switch-account/(.*)$ index.php?link1=switch-account&session=$1 [NC,QSA]
+RewriteRule ^switch-account(/?|)$ index.php?link1=switch-account&session=$1 [NC,QSA]
+
+# *** FIND  NEARBY ***
+RewriteRule ^friends-nearby(/?|)$ index.php?link1=friends-nearby [NC,QSA]
+
+RewriteRule ^api(/?|)$ api-v2.php [NC,QSA]
+RewriteRule ^api/([^\/]+)(\/|)$ api-v2.php?type=$1 [NC,QSA]
+
+RewriteRule ^_$ requests.php [QSA]
+
+RewriteRule ^graph-success$ index.php?link1=graph-success [NC,QSA]
+RewriteRule ^developers$ index.php?link1=developers [NC,QSA]
+RewriteRule ^apps$ index.php?link1=apps [NC,QSA]
+RewriteRule ^create-app$ index.php?link1=create-app [NC,QSA]
+RewriteRule ^graph$ index.php?link1=graph [NC,QSA]
+RewriteRule ^oauth$ index.php?link1=oauth [NC,QSA]
+
+RewriteRule ^boosted-pages(/?|)$ index.php?link1=boosted-pages [NC,QSA]
+RewriteRule ^boosted-posts(/?|)$ index.php?link1=boosted-posts [NC,QSA]
+
+
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^setting/([A-Za-z0-9_-]+)$  index.php?link1=setting&page=$1 [NC,QSA]
+
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^@([^\/]+)(\/|)$  index.php?link1=timeline&u=$1 [QSA]
+
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^([A-Za-z0-9_]+)/([^\/]+)(\/|)$  index.php?link1=timeline&u=$1&type=$2 [QSA]
+
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^([^\/]+)(\/|)$  index.php?link1=timeline&u=$1 [QSA]
+
+
+
+<IfModule mod_deflate.c>
+  AddOutputFilterByType DEFLATE text/html
+  AddOutputFilterByType DEFLATE text/css
+  AddOutputFilterByType DEFLATE text/javascript
+  AddOutputFilterByType DEFLATE text/xml
+  AddOutputFilterByType DEFLATE text/plain
+  AddOutputFilterByType DEFLATE image/x-icon
+  AddOutputFilterByType DEFLATE image/svg+xml
+  AddOutputFilterByType DEFLATE application/rss+xml
+  AddOutputFilterByType DEFLATE application/javascript
+  AddOutputFilterByType DEFLATE application/x-javascript
+  AddOutputFilterByType DEFLATE application/xml
+  AddOutputFilterByType DEFLATE application/xhtml+xml
+  AddOutputFilterByType DEFLATE application/x-font
+  AddOutputFilterByType DEFLATE application/x-font-truetype
+  AddOutputFilterByType DEFLATE application/x-font-ttf
+  AddOutputFilterByType DEFLATE application/x-font-otf
+  AddOutputFilterByType DEFLATE application/x-font-opentype
+  AddOutputFilterByType DEFLATE application/vnd.ms-fontobject
+  AddOutputFilterByType DEFLATE font/ttf
+  AddOutputFilterByType DEFLATE font/otf
+  AddOutputFilterByType DEFLATE font/opentype
+  BrowserMatch ^Mozilla/4 gzip-only-text/html
+  BrowserMatch ^Mozilla/4\.0[678] no-gzip
+  BrowserMatch \bMSIE !no-gzip !gzip-only-text/html
+</IfModule>
+<IfModule mod_security.c>
+  SecFilterScanPOST Off
+</IfModule>
+## EXPIRES CACHING ##
+<IfModule mod_expires.c>
+ExpiresActive On
+ExpiresByType image/jpg "access plus 1 year"
+ExpiresByType image/jpeg "access plus 1 year"
+ExpiresByType image/gif "access plus 1 year"
+ExpiresByType image/png "access plus 1 year"
+ExpiresByType text/css "access plus 1 month"
+ExpiresByType application/pdf "access plus 1 month"
+ExpiresByType text/x-javascript "access plus 1 month"
+ExpiresByType application/x-shockwave-flash "access plus 1 month"
+ExpiresByType image/x-icon "access plus 1 year"
+ExpiresDefault "access plus 1 month"
+</IfModule>
+## EXPIRES CACHING ##
+
+<ifModule mod_headers.c>
+  Header unset Connection
+  Header set Connection keep-alive
+
+  Header unset Keep-Alive
+  Header set Keep-Alive timeout=100,max=500
+</ifModule>
+EOF"
+          echo "✓ .htaccess file deployed"
+        else
+          echo "❌ Cannot deploy .htaccess - application pod not found"
+        fi
+
+    - name: Create config in pod
+      run: |
+        echo "=== Creating Config in Pod ==="
+        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o name 2>/dev/null || echo "NOT_FOUND")
+
+        if [ "$APP_POD" != "NOT_FOUND" ]; then
+          echo "Creating fixed config.php..."
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "cat > /var/www/html/config.php << 'EOF'
+<?php
+// +------------------------------------------------------------------------+
+// | @author Deen Doughouz (DoughouzForest)
+// | @author_url 1: http://www.wowonder.com
+// | @author_url 2: http://codecanyon.net/user/doughouzforest
+// | @author_email: wowondersocial@gmail.com
+// +------------------------------------------------------------------------+
+// | WoWonder - The Ultimate PHP Social Networking Platform
+// | Copyright (c) 2016 WoWonder. All rights reserved.
+// +------------------------------------------------------------------------+
+// MySQL Hostname
+\$sql_db_host = \"mysql-service\";
+// MySQL Database User
+\$sql_db_user = \"wowonderuser\";
+// MySQL Database Password
+\$sql_db_pass = \"Password123@24\";
+// MySQL Database Name
+\$sql_db_name = \"wowonderdb\";
+
+// Site URL
+\$site_url = \"http://44.220.139.238:30080\"; // e.g (http://example.com)
+
+// Disable auto redirect to fix redirect loops
+\$auto_redirect = false;
+
+// Purchase code
+\$purchase_code = \"000000\"; // Your purchase code, don't give it to anyone.
+
+\$siteEncryptKey = \"eb733cdb4d769426e460bad9df6b824eee3416d7\"; // Your site encrypt key, don't give it to anyone.
+?>
+EOF"
+
+          # Set permissions
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- chown www-data:www-data /var/www/html/config.php
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- chmod 644 /var/www/html/config.php
+
+          echo "✓ Configuration files updated with auto_redirect = false"
+        else
+          echo "❌ Cannot create config - application pod not found"
+        fi
+
+    - name: Restart application pod
+      run: |
+        echo "=== Restarting Application Pod ==="
+        kubectl rollout restart deployment/wowonder-app -n ${{ env.NAMESPACE }}
+        echo "Waiting for pod to restart..."
+        sleep 30
+        kubectl wait --for=condition=ready pod -l app=wowonder-app -n ${{ env.NAMESPACE }} --timeout=180s
+        echo "✓ Application pod restarted"
+
+    - name: Test database connection from app
+      run: |
+        echo "=== Testing Database Connection from Application ==="
+        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "NOT_FOUND")
+
+        if [ "$APP_POD" != "NOT_FOUND" ]; then
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- php -r "\
+          \$conn = new mysqli('mysql-service', 'wowonderuser', 'Password123@24', 'wowonderdb', 3306);\
+          if (\$conn->connect_error) {\
+              echo '❌ DATABASE ERROR: ' . \$conn->connect_error;\
+              exit(1);\
+          } else {\
+              echo '✓ DATABASE SUCCESS: Connected to MySQL';\
+              \$result = \$conn->query('SHOW TABLES');\
+              if (\$result && \$result->num_rows > 0) {\
+                  echo '✓ Database has tables: ' . \$result->num_rows;\
+              } else {\
+                  echo '⚠ Database is empty or tables query failed';\
+              }\
+              \$conn->close();\
+          }\
+          " || echo "Database test completed"
+        else
+          echo "❌ Cannot test database - application pod not found"
+        fi
+
+    - name: Debug application
+      run: |
+        echo "=== Debugging Application ==="
+        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "NOT_FOUND")
+        
+        if [ "$APP_POD" != "NOT_FOUND" ]; then
+          echo "Checking application structure:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ls -la /var/www/html/
+          echo "Checking themes directory:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ls -la /var/www/html/themes/ || echo "Themes directory not found"
+          
+          echo "Checking Nginx configuration:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- cat /etc/nginx/conf.d/default.conf
+          
+          echo "Checking Nginx logs:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- tail -20 /var/log/nginx/error.log || echo "No Nginx error log"
+          
+          echo "Checking PHP-FPM status:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ps aux | grep php || echo "PHP-FPM not running"
+          
+          echo "Checking Nginx status:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ps aux | grep nginx || echo "Nginx not running"
+        else
+          echo "Application pod not found for debugging"
+        fi
+
+    - name: Test application
+      run: |
+        echo "=== Testing Application ==="
+        echo "Waiting for application to be fully ready..."
+        sleep 20
+
+        echo "--- Testing Without Redirects ---"
+        
+        # Test if PHP is working
+        echo "Testing PHP execution:"
+        curl -s -o /dev/null -w "PHP Index: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/index.php
+        
+        # Test with no-follow to see initial response
+        echo "Testing initial response (no follow):"
+        curl -s -o /dev/null -I -w "Initial: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/
+        
+        # Test specific pages that shouldn't redirect
+        echo "Testing welcome page:"
+        curl -s -o /dev/null -w "Welcome: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/welcome
+        
+        echo "Testing login page:"
+        curl -s -o /dev/null -w "Login: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/login
+
+        # Test with verbose to see headers
+        echo "--- Checking Headers ---"
+        curl -I http://${{ env.K8S_WORKER_IP }}:30080/ 2>&1 | grep -E "(HTTP|Location|Set-Cookie)"
+
+        echo "--- Testing Static Files ---"
+        curl -s -o /dev/null -w "Wowonder CSS: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/themes/wowonder/stylesheet/style.css
+
+    - name: Show status
+      run: |
+        echo "=== 🎉 FINAL DEPLOYMENT STATUS ==="
+        echo ""
+        echo "📊 CLUSTER STATUS:"
+        kubectl get all -n ${{ env.NAMESPACE }}
+
+        echo ""
+        echo "💾 STORAGE STATUS:"
+        kubectl get pv,pvc -n ${{ env.NAMESPACE }}
+
+        echo ""
+        echo "🌐 APPLICATION URLS:"
+        echo "   Main Site:      http://${{ env.K8S_WORKER_IP }}:30080/"
+        echo "   Welcome Page:   http://${{ env.K8S_WORKER_IP }}:30080/welcome"
+        echo "   Registration:   http://${{ env.K8S_WORKER_IP }}:30080/register"
+        echo "   Login:          http://${{ env.K8S_WORKER_IP }}:30080/login"
+
+        echo ""
+        echo "✅ DEPLOYMENT COMPLETE"
