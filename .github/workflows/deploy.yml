@@ -61,8 +61,6 @@ jobs:
     - name: Cleanup previous deployment
       run: |
         echo "=== Cleaning previous deployment ==="
-        kubectl delete deployment wowonder-app -n ${{ env.NAMESPACE }} --ignore-not-found=true
-        kubectl delete service wowonder-service -n ${{ env.NAMESPACE }} --ignore-not-found=true
         kubectl delete all --all -n ${{ env.NAMESPACE }} --ignore-not-found=true
         kubectl delete pvc -n ${{ env.NAMESPACE }} --all --ignore-not-found=true
         kubectl delete namespace ${{ env.NAMESPACE }} --ignore-not-found=true
@@ -78,27 +76,76 @@ jobs:
         echo "=== Deploying Storage ==="
         kubectl apply -f k8s/storage.yaml
         sleep 10
+        echo "=== Storage Status ==="
+        kubectl get pv,pvc -n ${{ env.NAMESPACE }} -o wide
 
-    - name: Deploy MySQL
+    - name: Deploy MySQL with debugging
       run: |
         echo "=== Deploying MySQL ==="
         kubectl apply -f k8s/mysql.yaml
-        kubectl wait --for=condition=ready pod -l app=mysql -n ${{ env.NAMESPACE }} --timeout=300s
+        
+        echo "=== Waiting for MySQL with detailed debugging ==="
+        counter=0
+        max_wait=300
+        while [ $counter -lt $((max_wait/10)) ]; do
+          POD_NAME=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "NOT_FOUND")
+          POD_STATUS=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NOT_FOUND")
+          POD_READY=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+          
+          echo "Wait cycle $counter: Pod=$POD_NAME, Status=$POD_STATUS, Ready=$POD_READY"
+          
+          if [ "$POD_READY" = "true" ]; then
+            echo "✓ MySQL pod is ready!"
+            break
+          fi
+          
+          # Show detailed status every 3 cycles
+          if [ $((counter % 3)) -eq 0 ]; then
+            echo "=== Detailed Pod Status ==="
+            kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o wide
+            
+            if [ "$POD_NAME" != "NOT_FOUND" ]; then
+              echo "=== Pod Events ==="
+              kubectl describe pod $POD_NAME -n ${{ env.NAMESPACE }} | grep -A 10 "Events:" || echo "No events"
+              
+              echo "=== Pod Logs ==="
+              kubectl logs $POD_NAME -n ${{ env.NAMESPACE }} --tail=20 || echo "No logs yet"
+            fi
+            
+            echo "=== PVC Status ==="
+            kubectl get pvc -n ${{ env.NAMESPACE }} -o wide
+          fi
+          
+          sleep 10
+          counter=$((counter + 1))
+        done
+        
+        if [ "$POD_READY" != "true" ]; then
+          echo "❌ MySQL pod failed to become ready"
+          echo "=== Final Debug Info ==="
+          kubectl get all -n ${{ env.NAMESPACE }}
+          kubectl describe pvc mysql-pvc -n ${{ env.NAMESPACE }} || echo "No PVC details"
+          exit 1
+        fi
+        
+        echo "✅ MySQL is ready"
 
     - name: Initialize database
       run: |
         echo "=== Initializing Database ==="
         MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}')
         
-        # Wait for MySQL
+        # Wait for MySQL to accept connections
+        echo "Waiting for MySQL to accept connections..."
         timeout 120s bash -c "
           while ! kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysqladmin ping -uroot -prootpassword --silent; do
-            echo 'Waiting for MySQL...'
+            echo 'Waiting for MySQL connections...'
             sleep 10
           done
+          echo '✓ MySQL is accepting connections'
         "
         
-        # Create database
+        # Create database and user
         kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE DATABASE IF NOT EXISTS wowonderdb;"
         kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE USER IF NOT EXISTS 'wowonderuser'@'%' IDENTIFIED BY 'Password123@24';"
         kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "GRANT ALL PRIVILEGES ON wowonderdb.* TO 'wowonderuser'@'%';"
