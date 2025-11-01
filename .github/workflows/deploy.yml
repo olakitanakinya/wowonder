@@ -20,28 +20,6 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Fix config.php port
-      run: |
-        echo "=== Fixing config.php port ==="
-        if [ -f "config.php" ]; then
-          sed -i 's/:3008/:30080/g' config.php
-          sed -i 's/:300800/:30080/g' config.php
-          echo "Updated port to 30080 in config.php"
-        else
-          echo "Creating config.php with correct port..."
-          # Use echo commands instead of complex heredoc
-          echo '<?php' > config.php
-          echo '$sql_db_host = "mysql-service";' >> config.php
-          echo '$sql_db_user = "wowonderuser";' >> config.php
-          echo '$sql_db_pass = "Password123@24";' >> config.php
-          echo '$sql_db_name = "wowonderdb";' >> config.php
-          echo '$site_url = "http://44.220.139.238:30080";' >> config.php
-          echo '$auto_redirect = false;' >> config.php
-          echo '$purchase_code = "000000";' >> config.php
-          echo '$siteEncryptKey = "eb733cdb4d769426e460bad9df6b824eee3416d7";' >> config.php
-          echo '?>' >> config.php
-        fi
-
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
@@ -83,9 +61,10 @@ jobs:
     - name: Cleanup previous deployment
       run: |
         echo "=== Cleaning previous deployment ==="
+        kubectl delete deployment wowonder-app -n ${{ env.NAMESPACE }} --ignore-not-found=true
+        kubectl delete service wowonder-service -n ${{ env.NAMESPACE }} --ignore-not-found=true
         kubectl delete all --all -n ${{ env.NAMESPACE }} --ignore-not-found=true
         kubectl delete pvc -n ${{ env.NAMESPACE }} --all --ignore-not-found=true
-        kubectl delete pv --all --ignore-not-found=true
         kubectl delete namespace ${{ env.NAMESPACE }} --ignore-not-found=true
         sleep 10
 
@@ -94,239 +73,152 @@ jobs:
         kubectl create namespace ${{ env.NAMESPACE }}
         echo "Namespace ${{ env.NAMESPACE }} created"
 
-    - name: Setup storage directories on worker node
-      run: |
-        echo "=== Setting up storage directories on worker node ==="
-        cat << 'STORAGE' | kubectl apply -f -
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: storage-setup
-  namespace: ${{ env.NAMESPACE }}
-spec:
-  template:
-    spec:
-      nodeSelector:
-        kubernetes.io/hostname: worker
-      containers:
-      - name: storage-setup
-        image: busybox:1.35
-        command:
-        - /bin/sh
-        - -c
-        - |
-          echo "Creating storage directories on worker node..."
-          mkdir -p /mnt/data/wowonder /mnt/data/mysql
-          chmod -R 777 /mnt/data
-          echo "Storage directories created successfully"
-          ls -la /mnt/data/
-        volumeMounts:
-        - name: host-root
-          mountPath: /mnt
-      restartPolicy: OnFailure
-      volumes:
-      - name: host-root
-        hostPath:
-          path: /
-          type: Directory
-STORAGE
-
-        kubectl wait --for=condition=complete job/storage-setup -n ${{ env.NAMESPACE }} --timeout=60s
-        kubectl logs job/storage-setup -n ${{ env.NAMESPACE }}
-        kubectl delete job/storage-setup -n ${{ env.NAMESPACE }} --ignore-not-found=true
-
     - name: Deploy storage
       run: |
         echo "=== Deploying Storage ==="
         kubectl apply -f k8s/storage.yaml
-        sleep 15
-        echo "=== Storage Status ==="
-        kubectl get pv,pvc -n ${{ env.NAMESPACE }} -o wide
+        sleep 10
 
     - name: Deploy MySQL
       run: |
         echo "=== Deploying MySQL ==="
         kubectl apply -f k8s/mysql.yaml
-        kubectl wait --for=condition=ready pod -l app=mysql -n ${{ env.NAMESPACE }} --timeout=600s
+        kubectl wait --for=condition=ready pod -l app=mysql -n ${{ env.NAMESPACE }} --timeout=300s
 
     - name: Initialize database
       run: |
         echo "=== Initializing Database ==="
         MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}')
-        echo "MySQL pod: $MYSQL_POD"
-
-        # Wait for MySQL to be ready
-        timeout 180s bash -c "
+        
+        # Wait for MySQL
+        timeout 120s bash -c "
           while ! kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysqladmin ping -uroot -prootpassword --silent; do
-            echo '⏳ MySQL not ready yet...'
+            echo 'Waiting for MySQL...'
             sleep 10
           done
-          echo '✓ MySQL is ready and accepting connections'
         "
-
-        # Create database and user
+        
+        # Create database
         kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE DATABASE IF NOT EXISTS wowonderdb;"
         kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE USER IF NOT EXISTS 'wowonderuser'@'%' IDENTIFIED BY 'Password123@24';"
         kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "GRANT ALL PRIVILEGES ON wowonderdb.* TO 'wowonderuser'@'%';"
         kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "FLUSH PRIVILEGES;"
-
+        
         echo "✅ Database initialized"
 
-    - name: Create optimized deployment
+    - name: Create deployment file
       run: |
-        echo "=== Creating Optimized Deployment ==="
-        cat > k8s/optimized-deployment.yaml << 'DEPLOY'
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: wowonder-app
-  namespace: wowonder
-  labels:
-    app: wowonder-app
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: wowonder-app
-  template:
-    metadata:
-      labels:
-        app: wowonder-app
-    spec:
-      containers:
-      - name: wowonder-app
-        image: $DOCKER_IMAGE:latest
-        ports:
-        - containerPort: 80
-        env:
-        - name: MYSQL_HOST
-          value: "mysql-service"
-        - name: MYSQL_DATABASE
-          value: "wowonderdb"
-        - name: MYSQL_USER
-          value: "wowonderuser"
-        - name: MYSQL_PASSWORD
-          value: "Password123@24"
-        resources:
-          requests:
-            memory: "512Mi"
-            cpu: "250m"
-          limits:
-            memory: "1Gi"
-            cpu: "500m"
-        volumeMounts:
-        - name: wowonder-data
-          mountPath: /var/www/html/upload
-        - name: nginx-config
-          mountPath: /etc/nginx/conf.d
-        readinessProbe:
-          httpGet:
-            path: /
-            port: 80
-          initialDelaySeconds: 60
-          periodSeconds: 15
-        livenessProbe:
-          httpGet:
-            path: /
-            port: 80
-          initialDelaySeconds: 90
-          periodSeconds: 30
-      volumes:
-      - name: wowonder-data
-        persistentVolumeClaim:
-          claimName: wowonder-pvc
-      - name: nginx-config
-        configMap:
-          name: wowonder-nginx-config
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: wowonder-service
-  namespace: wowonder
-spec:
-  type: NodePort
-  selector:
-    app: wowonder-app
-  ports:
-    - protocol: TCP
-      port: 80
-      targetPort: 80
-      nodePort: 30080
-DEPLOY
-
-        # Replace the image placeholder
-        sed -i "s|\\$DOCKER_IMAGE|${{ env.DOCKER_IMAGE }}|g" k8s/optimized-deployment.yaml
-        echo "✓ Optimized deployment configuration created"
-
-    - name: Deploy with optimized configuration
-      run: |
-        echo "=== Deploying with Optimized Configuration ==="
-        kubectl delete deployment wowonder-app -n ${{ env.NAMESPACE }} --ignore-not-found=true
-        kubectl delete service wowonder-service -n ${{ env.NAMESPACE }} --ignore-not-found=true
-        sleep 10
+        echo "=== Creating Deployment File ==="
+        mkdir -p k8s
         
-        kubectl apply -f k8s/optimized-deployment.yaml
-        kubectl wait --for=condition=available deployment/wowonder-app -n ${{ env.NAMESPACE }} --timeout=600s
-        echo "✓ Deployment is available"
+        # Create the deployment file using echo commands
+        echo "apiVersion: apps/v1" > k8s/deployment.yaml
+        echo "kind: Deployment" >> k8s/deployment.yaml
+        echo "metadata:" >> k8s/deployment.yaml
+        echo "  name: wowonder-app" >> k8s/deployment.yaml
+        echo "  namespace: ${{ env.NAMESPACE }}" >> k8s/deployment.yaml
+        echo "  labels:" >> k8s/deployment.yaml
+        echo "    app: wowonder-app" >> k8s/deployment.yaml
+        echo "spec:" >> k8s/deployment.yaml
+        echo "  replicas: 1" >> k8s/deployment.yaml
+        echo "  selector:" >> k8s/deployment.yaml
+        echo "    matchLabels:" >> k8s/deployment.yaml
+        echo "      app: wowonder-app" >> k8s/deployment.yaml
+        echo "  template:" >> k8s/deployment.yaml
+        echo "    metadata:" >> k8s/deployment.yaml
+        echo "      labels:" >> k8s/deployment.yaml
+        echo "        app: wowonder-app" >> k8s/deployment.yaml
+        echo "    spec:" >> k8s/deployment.yaml
+        echo "      containers:" >> k8s/deployment.yaml
+        echo "      - name: wowonder-app" >> k8s/deployment.yaml
+        echo "        image: ${{ env.DOCKER_IMAGE }}:latest" >> k8s/deployment.yaml
+        echo "        ports:" >> k8s/deployment.yaml
+        echo "        - containerPort: 80" >> k8s/deployment.yaml
+        echo "        env:" >> k8s/deployment.yaml
+        echo "        - name: MYSQL_HOST" >> k8s/deployment.yaml
+        echo "          value: \"mysql-service\"" >> k8s/deployment.yaml
+        echo "        - name: MYSQL_DATABASE" >> k8s/deployment.yaml
+        echo "          value: \"wowonderdb\"" >> k8s/deployment.yaml
+        echo "        - name: MYSQL_USER" >> k8s/deployment.yaml
+        echo "          value: \"wowonderuser\"" >> k8s/deployment.yaml
+        echo "        - name: MYSQL_PASSWORD" >> k8s/deployment.yaml
+        echo "          value: \"Password123@24\"" >> k8s/deployment.yaml
+        echo "        resources:" >> k8s/deployment.yaml
+        echo "          requests:" >> k8s/deployment.yaml
+        echo "            memory: \"512Mi\"" >> k8s/deployment.yaml
+        echo "            cpu: \"250m\"" >> k8s/deployment.yaml
+        echo "          limits:" >> k8s/deployment.yaml
+        echo "            memory: \"1Gi\"" >> k8s/deployment.yaml
+        echo "            cpu: \"500m\"" >> k8s/deployment.yaml
+        echo "        volumeMounts:" >> k8s/deployment.yaml
+        echo "        - name: wowonder-data" >> k8s/deployment.yaml
+        echo "          mountPath: /var/www/html/upload" >> k8s/deployment.yaml
+        echo "        readinessProbe:" >> k8s/deployment.yaml
+        echo "          httpGet:" >> k8s/deployment.yaml
+        echo "            path: /" >> k8s/deployment.yaml
+        echo "            port: 80" >> k8s/deployment.yaml
+        echo "          initialDelaySeconds: 60" >> k8s/deployment.yaml
+        echo "          periodSeconds: 15" >> k8s/deployment.yaml
+        echo "        livenessProbe:" >> k8s/deployment.yaml
+        echo "          httpGet:" >> k8s/deployment.yaml
+        echo "            path: /" >> k8s/deployment.yaml
+        echo "            port: 80" >> k8s/deployment.yaml
+        echo "          initialDelaySeconds: 90" >> k8s/deployment.yaml
+        echo "          periodSeconds: 30" >> k8s/deployment.yaml
+        echo "      volumes:" >> k8s/deployment.yaml
+        echo "      - name: wowonder-data" >> k8s/deployment.yaml
+        echo "        persistentVolumeClaim:" >> k8s/deployment.yaml
+        echo "          claimName: wowonder-pvc" >> k8s/deployment.yaml
+        echo "---" >> k8s/deployment.yaml
+        echo "apiVersion: v1" >> k8s/deployment.yaml
+        echo "kind: Service" >> k8s/deployment.yaml
+        echo "metadata:" >> k8s/deployment.yaml
+        echo "  name: wowonder-service" >> k8s/deployment.yaml
+        echo "  namespace: ${{ env.NAMESPACE }}" >> k8s/deployment.yaml
+        echo "spec:" >> k8s/deployment.yaml
+        echo "  type: NodePort" >> k8s/deployment.yaml
+        echo "  selector:" >> k8s/deployment.yaml
+        echo "    app: wowonder-app" >> k8s/deployment.yaml
+        echo "  ports:" >> k8s/deployment.yaml
+        echo "    - protocol: TCP" >> k8s/deployment.yaml
+        echo "      port: 80" >> k8s/deployment.yaml
+        echo "      targetPort: 80" >> k8s/deployment.yaml
+        echo "      nodePort: 30080" >> k8s/deployment.yaml
+        
+        echo "✅ Deployment file created"
 
-    - name: Create fixed config in pod
+    - name: Deploy application
       run: |
-        echo "=== Creating Fixed Config in Pod ==="
-        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "NOT_FOUND")
+        echo "=== Deploying Application ==="
+        kubectl apply -f k8s/deployment.yaml
+        kubectl wait --for=condition=available deployment/wowonder-app -n ${{ env.NAMESPACE }} --timeout=300s
+        echo "✅ Application deployed"
 
-        if [ "$APP_POD" != "NOT_FOUND" ]; then
-          echo "Creating fixed config.php with correct port..."
-          # Use simple echo commands instead of complex heredoc
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '<?php' > /var/www/html/config.php"
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_host = \"mysql-service\";' >> /var/www/html/config.php"
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_user = \"wowonderuser\";' >> /var/www/html/config.php"
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_pass = \"Password123@24\";' >> /var/www/html/config.php"
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_name = \"wowonderdb\";' >> /var/www/html/config.php"
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$site_url = \"http://44.220.139.238:30080\";' >> /var/www/html/config.php"
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$auto_redirect = false;' >> /var/www/html/config.php"
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$purchase_code = \"000000\";' >> /var/www/html/config.php"
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$siteEncryptKey = \"eb733cdb4d769426e460bad9df6b824eee3416d7\";' >> /var/www/html/config.php"
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '?>' >> /var/www/html/config.php"
-
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- chown www-data:www-data /var/www/html/config.php
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- chmod 644 /var/www/html/config.php
-
-          echo "✓ Configuration files updated"
-        else
-          echo "❌ Cannot create config - application pod not found"
-        fi
+    - name: Configure application
+      run: |
+        echo "=== Configuring Application ==="
+        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}')
+        
+        # Create config.php
+        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '<?php' > /var/www/html/config.php"
+        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_host = \"mysql-service\";' >> /var/www/html/config.php"
+        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_user = \"wowonderuser\";' >> /var/www/html/config.php"
+        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_pass = \"Password123@24\";' >> /var/www/html/config.php"
+        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_name = \"wowonderdb\";' >> /var/www/html/config.php"
+        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$site_url = \"http://44.220.139.238:30080\";' >> /var/www/html/config.php"
+        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$auto_redirect = false;' >> /var/www/html/config.php"
+        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$purchase_code = \"000000\";' >> /var/www/html/config.php"
+        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$siteEncryptKey = \"eb733cdb4d769426e460bad9df6b824eee3416d7\";' >> /var/www/html/config.php"
+        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '?>' >> /var/www/html/config.php"
+        
+        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- chown www-data:www-data /var/www/html/config.php
+        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- chmod 644 /var/www/html/config.php
+        
+        echo "✅ Application configured"
 
     - name: Verify deployment
       run: |
         echo "=== Verifying Deployment ==="
-        kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o wide
-        CURRENT_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}')
-        READY_STATUS=$(kubectl get pod $CURRENT_POD -n ${{ env.NAMESPACE }} -o jsonpath='{.status.containerStatuses[0].ready}')
-        
-        if [ "$READY_STATUS" = "true" ]; then
-          echo "✅ Pod $CURRENT_POD is ready and healthy"
-        else
-          echo "❌ Pod $CURRENT_POD is not ready"
-          exit 1
-        fi
-
-    - name: Final test
-      run: |
-        echo "=== Final Test ==="
-        sleep 30
-        echo "Testing application..."
-        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://${{ env.K8S_WORKER_IP }}:30080/ || echo "000")
-        echo "HTTP Response Code: $HTTP_CODE"
-        
-        if [ "$HTTP_CODE" != "000" ]; then
-          echo "✅ Application is responding"
-        else
-          echo "⚠ Application may not be fully responsive yet"
-        fi
-
-    - name: Show final status
-      run: |
-        echo "=== 🎉 FINAL DEPLOYMENT STATUS ==="
+        kubectl get pods -n ${{ env.NAMESPACE }}
         echo "Application URL: http://${{ env.K8S_WORKER_IP }}:30080/"
         echo "✅ DEPLOYMENT COMPLETE"
