@@ -13,13 +13,20 @@ spec:
       labels:
         app: wowonder-app
     spec:
+      initContainers:
+      - name: fix-permissions
+        image: busybox
+        command: ['sh', '-c', 'mkdir -p /var/www/html/upload && chmod -R 755 /var/www/html/upload']
+        volumeMounts:
+        - name: upload-data
+          mountPath: /var/www/html/upload
       containers:
       - name: wowonder-app
-        image: $DOCKERHUB_USERNAME/wowonder-laravel:latest
+        image: $DOCKER_IMAGE:latest
         ports:
         - containerPort: 80
         volumeMounts:
-        - name: app-data
+        - name: upload-data
           mountPath: /var/www/html/upload
         resources:
           requests:
@@ -28,8 +35,18 @@ spec:
           limits:
             memory: "512Mi"
             cpu: "500m"
+        livenessProbe:
+          tcpSocket:
+            port: 80
+          initialDelaySeconds: 60
+          periodSeconds: 10
+        readinessProbe:
+          tcpSocket:
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 5
       volumes:
-      - name: app-data
+      - name: upload-data
         persistentVolumeClaim:
           claimName: wowonder-pvc
 ---

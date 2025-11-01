@@ -3,14 +3,45 @@ on:
   push:
     branches: [main]
 
+env:
+  DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/wowonder-laravel
+
 jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        push: true
+        tags: |
+          ${{ env.DOCKER_IMAGE }}:latest
+          ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
   deploy:
+    needs: build-and-push
     runs-on: self-hosted
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Setup k8s
+    - name: Setup Kubernetes
       uses: azure/setup-kubectl@v3
       
     - name: Configure kubeconfig
@@ -18,6 +49,13 @@ jobs:
         mkdir -p ~/.kube
         echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config
         kubectl get nodes
+
+    - name: Cleanup previous deployment
+      run: |
+        kubectl delete -f k8s/ || true
+        kubectl delete pvc -n wowonder --all || true
+        kubectl delete pv --all || true
+        sleep 10
 
     - name: Create namespace
       run: kubectl apply -f k8s/namespace.yaml
@@ -28,28 +66,78 @@ jobs:
     - name: Deploy MySQL
       run: |
         kubectl apply -f k8s/mysql.yaml
+        echo "Waiting for MySQL to be ready..."
+        sleep 30
         kubectl wait --for=condition=ready pod -l app=mysql -n wowonder --timeout=300s
 
     - name: Initialize database
       run: |
-        POD=$(kubectl get pods -l app=mysql -n wowonder -o name)
-        kubectl exec -n wowonder $POD -- mysql -uroot -prootpassword -e "
+        echo "Initializing database..."
+        # Wait for MySQL to be fully ready
+        sleep 20
+        
+        # Get MySQL pod name
+        MYSQL_POD=$(kubectl get pods -l app=mysql -n wowonder -o jsonpath='{.items[0].metadata.name}')
+        echo "MySQL pod: $MYSQL_POD"
+        
+        # Test MySQL connection
+        kubectl exec -n wowonder $MYSQL_POD -- mysqladmin ping -h localhost -uroot -prootpassword
+        
+        # Create database and user
+        kubectl exec -n wowonder $MYSQL_POD -- mysql -h localhost -uroot -prootpassword -e "
           CREATE DATABASE IF NOT EXISTS wowonderdb;
           CREATE USER IF NOT EXISTS 'wowonderuser'@'%' IDENTIFIED BY 'Password123@24';
           GRANT ALL PRIVILEGES ON wowonderdb.* TO 'wowonderuser'@'%';
           FLUSH PRIVILEGES;
+          SHOW DATABASES;
         "
+        
+        # Import SQL file if exists
         if [ -f "wowonderdb.sql" ]; then
-          kubectl cp wowonderdb.sql wowonder/$POD:/tmp/db.sql
-          kubectl exec -n wowonder $POD -- mysql -uroot -prootpassword wowonderdb < /tmp/db.sql
+          echo "Importing database schema..."
+          kubectl cp wowonderdb.sql wowonder/$MYSQL_POD:/tmp/db.sql
+          kubectl exec -n wowonder $MYSQL_POD -- mysql -h localhost -uroot -prootpassword wowonderdb -e "source /tmp/db.sql"
+          echo "Database imported successfully"
         fi
 
     - name: Deploy application
       run: |
-        sed "s|\$DOCKERHUB_USERNAME|${{ secrets.DOCKERHUB_USERNAME }}|g" k8s/laravel.yaml | kubectl apply -f -
+        # Update image in deployment
+        sed "s|\$DOCKER_IMAGE|${{ env.DOCKER_IMAGE }}|g" k8s/laravel.yaml | kubectl apply -f -
+        echo "Waiting for application to be ready..."
         kubectl wait --for=condition=ready pod -l app=wowonder-app -n wowonder --timeout=300s
 
-    - name: Verify
+    - name: Create config.php
       run: |
-        kubectl get all,pv,pvc -n wowonder
-        echo "App URL: http://44.220.139.238:30080"
+        APP_POD=$(kubectl get pods -l app=wowonder-app -n wowonder -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n wowonder $APP_POD -- sh -c "cat > /var/www/html/config.php" << 'EOF'
+        <?php
+        \$sql_db_host = \"mysql-service\";
+        \$sql_db_user = \"wowonderuser\";
+        \$sql_db_pass = \"Password123@24\";
+        \$sql_db_name = \"wowonderdb\";
+        \$site_url = \"http://44.220.139.238:30080\";
+        \$auto_redirect = true;
+        \$purchase_code = \"000000\";
+        \$siteEncryptKey = \"eb733cdb4d769426e460bad9df6b824eee3416d7\";
+        ?>
+        EOF
+
+    - name: Verify deployment
+      run: |
+        echo "=== Deployment Status ==="
+        kubectl get all -n wowonder
+        
+        echo ""
+        echo "=== Storage Status ==="
+        kubectl get pv,pvc -n wowonder
+        
+        echo ""
+        echo "=== Application URL ==="
+        echo "http://44.220.139.238:30080"
+        
+        echo ""
+        echo "=== Testing Application ==="
+        sleep 30
+        curl -s -o /dev/null -w "Status: %{http_code}\n" http://44.220.139.238:30080/ || echo "App starting..."
+        curl -s -o /dev/null -w "Welcome: %{http_code}\n" http://44.220.139.238:30080/welcome || echo "Welcome page starting..."
