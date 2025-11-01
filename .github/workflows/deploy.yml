@@ -290,19 +290,19 @@ EOF
         APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "NOT_FOUND")
         
         if [ "$APP_POD" != "NOT_FOUND" ]; then
-          # Create proper config.php with correct port
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "cat > /var/www/html/config.php" << 'EOF'
+          # Create proper config.php with correct port using a different method
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- bash -c 'cat > /var/www/html/config.php' << "CONFIG"
 <?php
-\$sql_db_host = "mysql-service";
-\$sql_db_user = "wowonderuser";
-\$sql_db_pass = "Password123@24";
-\$sql_db_name = "wowonderdb";
-\$site_url = "http://44.220.139.238:30080";
-\$auto_redirect = true;
-\$purchase_code = "000000";
-\$siteEncryptKey = "eb733cdb4d769426e460bad9df6b824eee3416d7";
+$sql_db_host = "mysql-service";
+$sql_db_user = "wowonderuser";
+$sql_db_pass = "Password123@24";
+$sql_db_name = "wowonderdb";
+$site_url = "http://44.220.139.238:30080";
+$auto_redirect = true;
+$purchase_code = "000000";
+$siteEncryptKey = "eb733cdb4d769426e460bad9df6b824eee3416d7";
 ?>
-EOF
+CONFIG
           
           # Set proper permissions
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- chown www-data:www-data /var/www/html/config.php
