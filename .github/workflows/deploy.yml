@@ -35,6 +35,74 @@ jobs:
           echo '?>' >> config.php
         fi
 
+    - name: Create Nginx configuration
+      run: |
+        echo "=== Creating Nginx Configuration ==="
+        cat > nginx.conf << 'EOF'
+        server {
+            listen 80;
+            server_name _;
+            root /var/www/html;
+            index index.php index.html;
+
+            client_max_body_size 2024M;
+            client_body_timeout 5000s;
+            fastcgi_read_timeout 4000s;
+            fastcgi_send_timeout 4000s;
+
+            location / {
+                try_files $uri $uri/ /index.php?$query_string;
+            }
+
+            location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|mp4|webm|ogg)$ {
+                expires 1y;
+                add_header Cache-Control "public, immutable";
+                try_files $uri $uri/ =404;
+            }
+
+            location /upload/ {
+                alias /var/www/html/upload/;
+                expires 1y;
+                add_header Cache-Control "public, immutable";
+                try_files $uri $uri/ =404;
+            }
+
+            location /assets/ {
+                alias /var/www/html/assets/;
+                expires 1y;
+                add_header Cache-Control "public";
+                try_files $uri $uri/ =404;
+            }
+
+            location /themes/ {
+                alias /var/www/html/themes/;
+                expires 1y;
+                add_header Cache-Control "public";
+                try_files $uri $uri/ =404;
+            }
+
+            location /admin-panel/ {
+                alias /var/www/html/admin-panel/;
+                try_files $uri $uri/ /admin-panel/index.php?$query_string;
+            }
+
+            location ~ \.php$ {
+                include fastcgi_params;
+                fastcgi_pass 127.0.0.1:9000;
+                fastcgi_index index.php;
+                fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                fastcgi_param PATH_INFO $fastcgi_path_info;
+            }
+
+            location ~ /\.ht {
+                deny all;
+            }
+        }
+        EOF
+        echo "Nginx configuration created"
+        echo "=== Verifying Nginx config ==="
+        cat nginx.conf
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
@@ -65,7 +133,7 @@ jobs:
 
     - name: Setup Kubernetes
       uses: azure/setup-kubectl@v3
-      
+
     - name: Configure kubeconfig
       run: |
         mkdir -p ~/.kube
@@ -124,14 +192,14 @@ jobs:
                   path: /
                   type: Directory
         EOF
-        
+
         # Wait for job completion
         echo "Waiting for storage setup job to complete..."
         kubectl wait --for=condition=complete job/storage-setup -n ${{ env.NAMESPACE }} --timeout=60s
-        
+
         # Check job logs
         kubectl logs job/storage-setup -n ${{ env.NAMESPACE }}
-        
+
         # Cleanup job
         kubectl delete job/storage-setup -n ${{ env.NAMESPACE }} --ignore-not-found=true
 
@@ -140,10 +208,10 @@ jobs:
         echo "=== Deploying Storage ==="
         kubectl apply -f k8s/storage.yaml
         sleep 15
-        
+
         echo "=== Storage Status ==="
         kubectl get pv,pvc -n ${{ env.NAMESPACE }} -o wide
-        
+
         echo "=== PVC Details ==="
         kubectl describe pvc -n ${{ env.NAMESPACE }}
 
@@ -151,15 +219,15 @@ jobs:
       run: |
         echo "=== Deploying MySQL ==="
         kubectl apply -f k8s/mysql.yaml
-        
+
         echo "=== Checking MySQL Pod Status ==="
         timeout 300s bash -c '
           while true; do
             POD_STATUS=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath="{.items[0].status.phase}" 2>/dev/null || echo "NotFound")
             POD_NODE=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath="{.items[0].spec.nodeName}" 2>/dev/null || echo "NoNode")
-            
+
             echo "Pod Status: $POD_STATUS, Node: $POD_NODE"
-            
+
             if [ "$POD_STATUS" = "Running" ]; then
               echo "✓ MySQL pod is running"
               break
@@ -169,7 +237,7 @@ jobs:
               MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || echo "not-found")
               if [ "$MYSQL_POD" != "not-found" ]; then
                 kubectl describe pod $MYSQL_POD -n ${{ env.NAMESPACE }}
-                
+
                 # Check events
                 echo "=== Recent Events ==="
                 kubectl get events -n ${{ env.NAMESPACE }} --sort-by='.lastTimestamp' | tail -10
@@ -184,7 +252,7 @@ jobs:
             fi
           done
         '
-        
+
         # Wait for pod to be ready
         echo "Waiting for MySQL to be ready..."
         kubectl wait --for=condition=ready pod -l app=mysql -n ${{ env.NAMESPACE }} --timeout=600s
@@ -203,7 +271,7 @@ jobs:
         echo "=== Initializing Database ==="
         MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}')
         echo "MySQL pod: $MYSQL_POD"
-        
+
         # Wait for MySQL to be ready to accept connections
         echo "Waiting for MySQL to accept connections..."
         timeout 180s bash -c "
@@ -213,52 +281,57 @@ jobs:
           done
           echo '✓ MySQL is ready and accepting connections'
         "
-        
+
         # Drop and recreate database to ensure clean state
         echo "Ensuring clean database state..."
         kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "DROP DATABASE IF EXISTS wowonderdb;"
         kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE DATABASE wowonderdb;"
-        
+
         # Create user
         echo "Creating database user..."
         kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "DROP USER IF EXISTS 'wowonderuser'@'%';"
         kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE USER 'wowonderuser'@'%' IDENTIFIED BY 'Password123@24';"
         kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "GRANT ALL PRIVILEGES ON wowonderdb.* TO 'wowonderuser'@'%';"
         kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "FLUSH PRIVILEGES;"
-        
+
         echo "✅ Database and user created successfully"
         kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "SHOW DATABASES;"
-        
+
         # Import SQL file with error handling for existing tables
         echo "Importing database schema from wowonderdb.sql..."
         if [ -f "wowonderdb.sql" ]; then
           echo "✓ wowonderdb.sql file found, size: $(wc -l < wowonderdb.sql) lines"
-          
+
           # Copy file to pod
           echo "Copying SQL file to MySQL pod..."
           kubectl cp wowonderdb.sql ${{ env.NAMESPACE }}/$MYSQL_POD:/tmp/db.sql
-          
+
           # Verify file was copied
           echo "Verifying file copy..."
           kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- ls -la /tmp/db.sql
-          
+
           # Import database with force option to ignore errors
           echo "Importing database schema (ignoring duplicate table errors)..."
           kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- bash -c "mysql -uroot -prootpassword wowonderdb < /tmp/db.sql 2>/dev/null || echo 'Import completed with some warnings'"
           echo "✓ Database import completed"
-          
+
           # Verify import
           echo "Verifying database tables:"
           kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword wowonderdb -e "SHOW TABLES;"
-          
+
           # Count tables
           TABLE_COUNT=$(kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword wowonderdb -e "SHOW TABLES;" | wc -l)
           echo "✓ Database has $((TABLE_COUNT - 1)) tables"
         else
           echo "⚠ wowonderdb.sql not found, using empty database"
         fi
-        
+
         echo "✅ Database initialization completed"
+
+    - name: Deploy Nginx ConfigMap
+      run: |
+        echo "=== Deploying Nginx ConfigMap ==="
+        kubectl apply -f k8s/nginx-config.yaml
 
     - name: Deploy application
       run: |
@@ -266,7 +339,7 @@ jobs:
         # Create a temporary file with the image replaced
         cat k8s/laravel.yaml | sed "s|\$DOCKER_IMAGE|${{ env.DOCKER_IMAGE }}|g" > k8s/laravel-deploy.yaml
         kubectl apply -f k8s/laravel-deploy.yaml
-        
+
         echo "Waiting for application pod..."
         timeout 180s bash -c '
           while true; do
@@ -287,7 +360,7 @@ jobs:
       run: |
         echo "=== Creating Config in Pod ==="
         APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o name 2>/dev/null || echo "NOT_FOUND")
-        
+
         if [ "$APP_POD" != "NOT_FOUND" ]; then
           # Create config.php using multiple commands to avoid heredoc issues
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '<?php' > /var/www/html/config.php"
@@ -300,11 +373,11 @@ jobs:
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$purchase_code = \"000000\";' >> /var/www/html/config.php"
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$siteEncryptKey = \"eb733cdb4d769426e460bad9df6b824eee3416d7\";' >> /var/www/html/config.php"
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '?>' >> /var/www/html/config.php"
-          
+
           # Set permissions
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- chown www-data:www-data /var/www/html/config.php
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- chmod 644 /var/www/html/config.php
-          
+
           echo "✓ Configuration files updated"
         else
           echo "❌ Cannot create config - application pod not found"
@@ -314,7 +387,7 @@ jobs:
       run: |
         echo "=== Testing Database Connection from Application ==="
         APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "NOT_FOUND")
-        
+
         if [ "$APP_POD" != "NOT_FOUND" ]; then
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- php -r "\
           \$conn = new mysqli('mysql-service', 'wowonderuser', 'Password123@24', 'wowonderdb', 3306);\
@@ -336,23 +409,64 @@ jobs:
           echo "❌ Cannot test database - application pod not found"
         fi
 
+    - name: Debug application
+      run: |
+        echo "=== Debugging Application ==="
+        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "NOT_FOUND")
+        
+        if [ "$APP_POD" != "NOT_FOUND" ]; then
+          echo "Checking application structure:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ls -la /var/www/html/
+          echo "Checking themes directory:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ls -la /var/www/html/themes/
+          
+          echo "Checking Nginx configuration:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- cat /etc/nginx/conf.d/default.conf
+          
+          echo "Checking Nginx logs:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- tail -20 /var/log/nginx/error.log || echo "No Nginx error log"
+          
+          echo "Checking PHP-FPM status:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ps aux | grep php || echo "PHP-FPM not running"
+          
+          echo "Checking Nginx status:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ps aux | grep nginx || echo "Nginx not running"
+        else
+          echo "Application pod not found for debugging"
+        fi
+
     - name: Test application
       run: |
         echo "=== Testing Application ==="
         echo "Waiting for application to be fully ready..."
         sleep 30
+
+        echo "--- Testing Specific Endpoints ---"
         
-        echo "--- Testing Basic Connectivity ---"
-        curl -s -o /dev/null -w "Root Endpoint: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/ || echo "❌ Root endpoint failed"
+        # Test if PHP is working
+        echo "Testing PHP execution:"
+        curl -s -o /dev/null -w "PHP Index: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/index.php
         
-        echo "--- Testing Welcome Page ---"
-        curl -s -o /dev/null -w "Welcome Page: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/welcome || echo "❌ Welcome page failed"
+        # Test static files with correct paths
+        echo "Testing CSS files:"
+        curl -s -o /dev/null -w "Wowonder CSS: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/themes/wowonder/stylesheet/style.css || echo "Wowonder CSS not found"
+        curl -s -o /dev/null -w "Sunshine CSS: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/themes/sunshine/stylesheet/style.css || echo "Sunshine CSS not found"
         
-        echo "--- Testing Static Files ---"
-        curl -s -o /dev/null -w "CSS File: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/themes/wowonder/css/style.css || echo "❌ CSS file failed"
+        # Test JavaScript files
+        echo "Testing JavaScript files:"
+        curl -s -o /dev/null -w "Main JS: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/themes/wowonder/javascript/script.js || echo "Main JS not found"
         
-        echo "--- Testing PHP ---"
-        curl -s -o /dev/null -w "PHP Index: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/index.php || echo "❌ PHP failed"
+        # Test upload directory
+        echo "Testing upload directory:"
+        curl -s -o /dev/null -w "Upload Dir: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/upload/ || echo "Upload directory not accessible"
+        
+        # Test assets
+        echo "Testing assets:"
+        curl -s -o /dev/null -w "Assets Dir: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/assets/ || echo "Assets directory not accessible"
+
+        # Test with verbose output to see redirects
+        echo "--- Verbose Testing ---"
+        curl -v http://${{ env.K8S_WORKER_IP }}:30080/ 2>&1 | grep -E "(Location:|HTTP/)"
 
     - name: Show status
       run: |
@@ -360,17 +474,17 @@ jobs:
         echo ""
         echo "📊 CLUSTER STATUS:"
         kubectl get all -n ${{ env.NAMESPACE }}
-        
+
         echo ""
         echo "💾 STORAGE STATUS:"
         kubectl get pv,pvc -n ${{ env.NAMESPACE }}
-        
+
         echo ""
         echo "🌐 APPLICATION URLS:"
         echo "   Main Site:      http://${{ env.K8S_WORKER_IP }}:30080/"
         echo "   Welcome Page:   http://${{ env.K8S_WORKER_IP }}:30080/welcome"
         echo "   Registration:   http://${{ env.K8S_WORKER_IP }}:30080/register"
         echo "   Login:          http://${{ env.K8S_WORKER_IP }}:30080/login"
-        
+
         echo ""
         echo "✅ DEPLOYMENT COMPLETE"

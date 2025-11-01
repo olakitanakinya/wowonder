@@ -35,7 +35,7 @@ COPY . .
 # Create directories and set permissions
 RUN mkdir -p upload cache admin-panel && \
     chown -R www-data:www-data /var/www/html && \
-    chmod -R 755 upload cache admin-panel
+    chmod -R 755 upload cache admin-panel themes assets
 
 # Test nginx configuration
 RUN nginx -t
@@ -45,4 +45,3 @@ EXPOSE 80
 
 # Start supervisor
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
-
