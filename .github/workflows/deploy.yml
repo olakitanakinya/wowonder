@@ -29,7 +29,8 @@ jobs:
           echo "Updated port to 30080 in config.php"
         else
           echo "Creating config.php with correct port..."
-          cat > config.php << 'CONFIG_EOF'
+          # Use a simpler approach without complex heredoc
+          cat > config.php << 'CONFIG'
 <?php
 \$sql_db_host = "mysql-service";
 \$sql_db_user = "wowonderuser";
@@ -40,7 +41,7 @@ jobs:
 \$purchase_code = "000000";
 \$siteEncryptKey = "eb733cdb4d769426e460bad9df6b824eee3416d7";
 ?>
-CONFIG_EOF
+CONFIG
         fi
 
     - name: Set up Docker Buildx
@@ -98,7 +99,7 @@ CONFIG_EOF
     - name: Setup storage directories on worker node
       run: |
         echo "=== Setting up storage directories on worker node ==="
-        kubectl apply -f - << "STORAGE_EOF"
+        kubectl apply -f - << "STORAGE"
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -130,7 +131,7 @@ spec:
         hostPath:
           path: /
           type: Directory
-STORAGE_EOF
+STORAGE
 
         kubectl wait --for=condition=complete job/storage-setup -n ${{ env.NAMESPACE }} --timeout=60s
         kubectl logs job/storage-setup -n ${{ env.NAMESPACE }}
@@ -269,7 +270,7 @@ STORAGE_EOF
     - name: Deploy Nginx ConfigMap with redirect fixes
       run: |
         echo "=== Deploying Nginx ConfigMap with Redirect Fixes ==="
-        kubectl apply -f - << "NGINX_EOF"
+        kubectl apply -f - << "NGINX"
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -351,14 +352,14 @@ data:
             deny all;
         }
     }
-NGINX_EOF
+NGINX
         echo "✓ Nginx ConfigMap deployed with comprehensive redirect fixes"
 
     - name: Create optimized deployment
       run: |
         echo "=== Creating Optimized Deployment ==="
         
-        cat > k8s/optimized-deployment.yaml << "DEPLOYMENT_EOF"
+        cat > k8s/optimized-deployment.yaml << "DEPLOY"
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -464,7 +465,7 @@ spec:
       port: 80
       targetPort: 80
       nodePort: 30080
-DEPLOYMENT_EOF
+DEPLOY
         
         # Replace the image placeholder
         sed -i "s|\\$DOCKER_IMAGE|${{ env.DOCKER_IMAGE }}|g" k8s/optimized-deployment.yaml
@@ -568,7 +569,7 @@ DEPLOYMENT_EOF
           echo "Creating fixed config.php with correct port..."
           
           # Create config.php using a single command to avoid multiple exec calls
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "cat > /var/www/html/config.php << 'CONFIG_EOF'
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "cat > /var/www/html/config.php << 'CONFIG'
 <?php
 // MySQL Hostname
 \$sql_db_host = \"mysql-service\";
@@ -587,7 +588,7 @@ DEPLOYMENT_EOF
 // Site encrypt key
 \$siteEncryptKey = \"eb733cdb4d769426e460bad9df6b824eee3416d7\";
 ?>
-CONFIG_EOF"
+CONFIG"
 
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- chown www-data:www-data /var/www/html/config.php
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- chmod 644 /var/www/html/config.php
