@@ -9,12 +9,13 @@ RUN apt-get update && apt-get install -y \
 # Install PHP extensions
 RUN docker-php-ext-install pdo pdo_mysql mysqli mbstring gd zip
 
-# Create nginx directories
-RUN mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+# Create nginx directories and remove existing default
+RUN mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled && \
+    rm -f /etc/nginx/sites-enabled/default
 
 # Copy configurations
 COPY nginx.conf /etc/nginx/sites-available/default
-RUN ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/
+RUN ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/
 
 COPY php.ini /usr/local/etc/php/conf.d/custom.ini
 
