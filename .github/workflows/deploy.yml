@@ -189,38 +189,48 @@ jobs:
         echo "Waiting for MySQL to be ready..."
         kubectl wait --for=condition=ready pod -l app=mysql -n ${{ env.NAMESPACE }} --timeout=600s
 
+    - name: Check MySQL pod status
+      run: |
+        echo "=== MySQL Pod Status ==="
+        kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o wide
+        echo ""
+        echo "=== MySQL Pod Logs ==="
+        MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}')
+        kubectl logs $MYSQL_POD -n ${{ env.NAMESPACE }} --tail=20
+
     - name: Initialize database
       run: |
         echo "=== Initializing Database ==="
-        MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o name)
+        MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}')
         echo "MySQL pod: $MYSQL_POD"
         
         # Wait for MySQL to be ready to accept connections
         echo "Waiting for MySQL to accept connections..."
-        timeout 120s bash -c '
+        timeout 180s bash -c "
           while ! kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysqladmin ping -uroot -prootpassword --silent; do
-            echo "⏳ MySQL not ready yet..."
+            echo '⏳ MySQL not ready yet...'
             sleep 10
           done
-          echo "✓ MySQL is ready and accepting connections"
-        '
+          echo '✓ MySQL is ready and accepting connections'
+        "
         
         # Create database and user
         echo "Creating database and user..."
-        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE DATABASE IF NOT EXISTS wowonderdb;" || echo "Database creation completed"
-        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE USER IF NOT EXISTS 'wowonderuser'@'%' IDENTIFIED BY 'Password123@24';" || echo "User creation completed"
-        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "GRANT ALL PRIVILEGES ON wowonderdb.* TO 'wowonderuser'@'%';" || echo "Privileges granted"
-        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "FLUSH PRIVILEGES;" || echo "Privileges flushed"
-        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "SHOW DATABASES;" || echo "Database list shown"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE DATABASE IF NOT EXISTS wowonderdb;"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE USER IF NOT EXISTS 'wowonderuser'@'%' IDENTIFIED BY 'Password123@24';"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "GRANT ALL PRIVILEGES ON wowonderdb.* TO 'wowonderuser'@'%';"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "FLUSH PRIVILEGES;"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "SHOW DATABASES;"
         
-        # Import SQL if exists
-        if [ -f "wowonderdb.sql" ]; then
-          echo "Importing database schema..."
-          kubectl cp wowonderdb.sql ${{ env.NAMESPACE }}/${MYSQL_POD#pod/}:/tmp/db.sql
-          kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword wowonderdb < /tmp/db.sql && echo "✓ Database imported" || echo "⚠ Database import completed with warnings"
-        else
-          echo "ℹ No wowonderdb.sql file found, using existing database structure"
-        fi
+        # Import SQL file
+        echo "Importing database schema from wowonderdb.sql..."
+        kubectl cp wowonderdb.sql ${{ env.NAMESPACE }}/$MYSQL_POD:/tmp/db.sql
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword wowonderdb < /tmp/db.sql
+        echo "✓ Database imported successfully"
+        
+        # Verify import
+        echo "Verifying database tables:"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword wowonderdb -e "SHOW TABLES;"
 
     - name: Deploy application
       run: |
@@ -272,6 +282,32 @@ jobs:
           echo "❌ Cannot create config - application pod not found"
         fi
 
+    - name: Test database connection from app
+      run: |
+        echo "=== Testing Database Connection from Application ==="
+        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "NOT_FOUND")
+        
+        if [ "$APP_POD" != "NOT_FOUND" ]; then
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- php -r "\
+          \$conn = new mysqli('mysql-service', 'wowonderuser', 'Password123@24', 'wowonderdb', 3306);\
+          if (\$conn->connect_error) {\
+              echo '❌ DATABASE ERROR: ' . \$conn->connect_error;\
+              exit(1);\
+          } else {\
+              echo '✓ DATABASE SUCCESS: Connected to MySQL';\
+              \$result = \$conn->query('SHOW TABLES');\
+              if (\$result && \$result->num_rows > 0) {\
+                  echo '✓ Database has tables: ' . \$result->num_rows;\
+              } else {\
+                  echo '⚠ Database is empty or tables query failed';\
+              }\
+              \$conn->close();\
+          }\
+          " || echo "Database test completed"
+        else
+          echo "❌ Cannot test database - application pod not found"
+        fi
+
     - name: Test application
       run: |
         echo "=== Testing Application ==="
@@ -285,7 +321,7 @@ jobs:
         curl -s -o /dev/null -w "Welcome Page: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/welcome || echo "❌ Welcome page failed"
         
         echo "--- Testing Static Files ---"
-        curl -s -o /dev/null -w "CSS File: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/themes/wowonder/css/style.css || echo "❌ CSS file failed"
+        curl -s -o /dev/null -w "CSS File: %{http_code}\n" http://$${{ env.K8S_WORKER_IP }}:30080/themes/wowonder/css/style.css || echo "❌ CSS file failed"
         
         echo "--- Testing PHP ---"
         curl -s -o /dev/null -w "PHP Index: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/index.php || echo "❌ PHP failed"
