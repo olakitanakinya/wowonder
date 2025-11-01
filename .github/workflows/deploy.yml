@@ -40,17 +40,18 @@ jobs:
         else
           echo "config.php not found, creating one..."
           cat > config.php << 'EOF'
-          <?php
-          $sql_db_host = "mysql-service";
-          $sql_db_user = "wowonderuser";
-          $sql_db_pass = "Password123@24";
-          $sql_db_name = "wowonderdb";
-          $site_url = "http://44.220.139.238:30080";
-          $auto_redirect = true;
-          $purchase_code = "000000";
-          $siteEncryptKey = "eb733cdb4d769426e460bad9df6b824eee3416d7";
-          ?>
-          EOF
+<?php
+$sql_db_host = "mysql-service";
+$sql_db_user = "wowonderuser";
+$sql_db_pass = "Password123@24";
+$sql_db_name = "wowonderdb";
+$site_url = "http://44.220.139.238:30080";
+$auto_redirect = true;
+$purchase_code = "000000";
+$siteEncryptKey = "eb733cdb4d769426e460bad9df6b824eee3416d7";
+?>
+EOF
+          echo "Created new config.php with correct port"
         fi
 
     - name: Set up Docker Buildx
@@ -291,17 +292,17 @@ jobs:
         if [ "$APP_POD" != "NOT_FOUND" ]; then
           # Create proper config.php with correct port
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "cat > /var/www/html/config.php" << 'EOF'
-          <?php
-          \$sql_db_host = "mysql-service";
-          \$sql_db_user = "wowonderuser";
-          \$sql_db_pass = "Password123@24";
-          \$sql_db_name = "wowonderdb";
-          \$site_url = "http://44.220.139.238:30080";
-          \$auto_redirect = true;
-          \$purchase_code = "000000";
-          \$siteEncryptKey = "eb733cdb4d769426e460bad9df6b824eee3416d7";
-          ?>
-          EOF
+<?php
+\$sql_db_host = "mysql-service";
+\$sql_db_user = "wowonderuser";
+\$sql_db_pass = "Password123@24";
+\$sql_db_name = "wowonderdb";
+\$site_url = "http://44.220.139.238:30080";
+\$auto_redirect = true;
+\$purchase_code = "000000";
+\$siteEncryptKey = "eb733cdb4d769426e460bad9df6b824eee3416d7";
+?>
+EOF
           
           # Set proper permissions
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- chown www-data:www-data /var/www/html/config.php
@@ -360,9 +361,3 @@ jobs:
         echo ""
         echo "📊 DEPLOYMENT STATUS:"
         kubectl get pods -n ${{ env.NAMESPACE }} -o wide
-        
-        echo ""
-        echo "📝 NEXT STEPS:"
-        echo "   1. Check browser at: http://${{ env.K8S_WORKER_IP }}:30080"
-        echo "   2. If issues persist, check logs above"
-        echo "   3. Verify database connection from application pod"
