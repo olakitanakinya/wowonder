@@ -7,9 +7,19 @@ spec:
     storage: 5Gi
   accessModes:
     - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual
   hostPath:
     path: /mnt/data/wowonder
     type: DirectoryOrCreate
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          - worker
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -22,6 +32,7 @@ spec:
   resources:
     requests:
       storage: 5Gi
+  storageClassName: manual
 ---
 apiVersion: v1
 kind: PersistentVolume
@@ -32,9 +43,19 @@ spec:
     storage: 5Gi
   accessModes:
     - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual
   hostPath:
     path: /mnt/data/mysql
     type: DirectoryOrCreate
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          - worker
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -47,3 +68,4 @@ spec:
   resources:
     requests:
       storage: 5Gi
+  storageClassName: manual

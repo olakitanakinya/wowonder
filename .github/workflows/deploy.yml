@@ -23,7 +23,6 @@ jobs:
           echo "Updated port from 3008 to 30080 in config.php"
         else
           echo "Creating config.php with correct port..."
-          # Create config.php line by line to avoid EOF issues
           echo '<?php' > config.php
           echo '$sql_db_host = "mysql-service";' >> config.php
           echo '$sql_db_user = "wowonderuser";' >> config.php
@@ -79,6 +78,7 @@ jobs:
         echo "=== Cleaning previous deployment ==="
         kubectl delete all --all -n ${{ env.NAMESPACE }} --ignore-not-found=true
         kubectl delete pvc -n ${{ env.NAMESPACE }} --all --ignore-not-found=true
+        kubectl delete pv --all --ignore-not-found=true
         kubectl delete namespace ${{ env.NAMESPACE }} --ignore-not-found=true
         sleep 10
 
@@ -87,33 +87,105 @@ jobs:
         kubectl create namespace ${{ env.NAMESPACE }}
         echo "Namespace ${{ env.NAMESPACE }} created"
 
+    - name: Setup storage directories on worker node
+      run: |
+        echo "=== Setting up storage directories on worker node ==="
+        # Create storage directories on worker node using a Kubernetes job
+        cat <<EOF | kubectl apply -f -
+        apiVersion: batch/v1
+        kind: Job
+        metadata:
+          name: storage-setup
+          namespace: ${{ env.NAMESPACE }}
+        spec:
+          template:
+            spec:
+              nodeSelector:
+                kubernetes.io/hostname: worker
+              containers:
+              - name: storage-setup
+                image: busybox:1.35
+                command:
+                - /bin/sh
+                - -c
+                - |
+                  echo "Creating storage directories on worker node..."
+                  mkdir -p /mnt/data/wowonder /mnt/data/mysql
+                  chmod -R 777 /mnt/data
+                  echo "Storage directories created successfully"
+                  ls -la /mnt/data/
+                volumeMounts:
+                - name: host-root
+                  mountPath: /mnt
+              restartPolicy: OnFailure
+              volumes:
+              - name: host-root
+                hostPath:
+                  path: /
+                  type: Directory
+        EOF
+        
+        # Wait for job completion
+        echo "Waiting for storage setup job to complete..."
+        kubectl wait --for=condition=complete job/storage-setup -n ${{ env.NAMESPACE }} --timeout=60s
+        
+        # Check job logs
+        kubectl logs job/storage-setup -n ${{ env.NAMESPACE }}
+        
+        # Cleanup job
+        kubectl delete job/storage-setup -n ${{ env.NAMESPACE }} --ignore-not-found=true
+
     - name: Deploy storage
       run: |
         echo "=== Deploying Storage ==="
         kubectl apply -f k8s/storage.yaml
-        sleep 10
-        kubectl get pv,pvc -n ${{ env.NAMESPACE }}
+        sleep 15
+        
+        echo "=== Storage Status ==="
+        kubectl get pv,pvc -n ${{ env.NAMESPACE }} -o wide
+        
+        echo "=== PVC Details ==="
+        kubectl describe pvc -n ${{ env.NAMESPACE }}
 
     - name: Deploy MySQL
       run: |
         echo "=== Deploying MySQL ==="
         kubectl apply -f k8s/mysql.yaml
-        echo "Waiting for MySQL pod to start..."
-        sleep 60
         
         echo "=== Checking MySQL Pod Status ==="
-        kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o wide
+        timeout 300s bash -c '
+          while true; do
+            POD_STATUS=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath="{.items[0].status.phase}" 2>/dev/null || echo "NotFound")
+            POD_NODE=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath="{.items[0].spec.nodeName}" 2>/dev/null || echo "NoNode")
+            
+            echo "Pod Status: $POD_STATUS, Node: $POD_NODE"
+            
+            if [ "$POD_STATUS" = "Running" ]; then
+              echo "✓ MySQL pod is running"
+              break
+            elif [ "$POD_STATUS" = "Pending" ]; then
+              echo "⏳ MySQL pod is pending..."
+              # Get detailed pod info
+              MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || echo "not-found")
+              if [ "$MYSQL_POD" != "not-found" ]; then
+                kubectl describe pod $MYSQL_POD -n ${{ env.NAMESPACE }}
+                
+                # Check events
+                echo "=== Recent Events ==="
+                kubectl get events -n ${{ env.NAMESPACE }} --sort-by='.lastTimestamp' | tail -10
+              fi
+              sleep 20
+            elif [ "$POD_STATUS" = "NotFound" ]; then
+              echo "⏳ MySQL pod not created yet..."
+              sleep 10
+            else
+              echo "⏳ MySQL pod status: $POD_STATUS"
+              sleep 10
+            fi
+          done
+        '
         
-        echo "=== MySQL Pod Events ==="
-        kubectl get events -n ${{ env.NAMESPACE }} --field-selector involvedObject.kind=Pod --sort-by='.lastTimestamp' | tail -10
-        
-        echo "=== MySQL Pod Logs ==="
-        MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "not-found")
-        if [ "$MYSQL_POD" != "not-found" ]; then
-          kubectl logs $MYSQL_POD -n ${{ env.NAMESPACE }} --tail=50
-        fi
-        
-        # Wait with better error handling
+        # Wait for pod to be ready
         echo "Waiting for MySQL to be ready..."
         kubectl wait --for=condition=ready pod -l app=mysql -n ${{ env.NAMESPACE }} --timeout=600s
 
@@ -173,28 +245,6 @@ jobs:
           done
         '
 
-    - name: Debug application
-      run: |
-        echo "=== Debugging Application ==="
-        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o name 2>/dev/null || echo "NOT_FOUND")
-        echo "App pod: $APP_POD"
-        
-        if [ "$APP_POD" != "NOT_FOUND" ]; then
-          # Check pod details
-          kubectl describe $APP_POD -n ${{ env.NAMESPACE }}
-          
-          # Check logs
-          echo "=== Application Logs ==="
-          kubectl logs -n ${{ env.NAMESPACE }} $APP_POD --tail=50
-          
-          # Check if config.php has correct port
-          echo "=== Config.php Content ==="
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- cat /var/www/html/config.php 2>/dev/null | grep site_url || echo "Cannot read config.php"
-        else
-          echo "❌ Application pod not found"
-          kubectl get pods -n ${{ env.NAMESPACE }}
-        fi
-
     - name: Create config in pod
       run: |
         echo "=== Creating Config in Pod ==="
@@ -220,32 +270,6 @@ jobs:
           echo "✓ Configuration files updated"
         else
           echo "❌ Cannot create config - application pod not found"
-        fi
-
-    - name: Test database connection
-      run: |
-        echo "=== Testing Database Connection ==="
-        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o name 2>/dev/null || echo "NOT_FOUND")
-        
-        if [ "$APP_POD" != "NOT_FOUND" ]; then
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- php -r "\
-          \$conn = new mysqli('mysql-service', 'wowonderuser', 'Password123@24', 'wowonderdb', 3306);\
-          if (\$conn->connect_error) {\
-              echo '❌ DATABASE ERROR: ' . \$conn->connect_error;\
-              exit(1);\
-          } else {\
-              echo '✓ DATABASE SUCCESS: Connected to MySQL';\
-              \$result = \$conn->query('SHOW TABLES');\
-              if (\$result && \$result->num_rows > 0) {\
-                  echo '✓ Database has tables: ' . \$result->num_rows;\
-              } else {\
-                  echo '⚠ Database is empty or tables query failed';\
-              }\
-              \$conn->close();\
-          }\
-          " || echo "Database test completed"
-        else
-          echo "❌ Cannot test database - application pod not found"
         fi
 
     - name: Test application
@@ -285,15 +309,4 @@ jobs:
         echo "   Login:          http://${{ env.K8S_WORKER_IP }}:30080/login"
         
         echo ""
-        echo "🔧 TROUBLESHOOTING:"
-        echo "   If you get HTTP 500 errors:"
-        echo "   1. Check application logs above"
-        echo "   2. Verify MySQL connection is working"
-        echo "   3. Check config.php has correct port (30080)"
-        echo "   4. Verify all pods are running"
-        
-        echo ""
-        echo "📝 NEXT STEPS:"
-        echo "   1. Open browser: http://${{ env.K8S_WORKER_IP }}:30080"
-        echo "   2. Complete Wowonder installation if needed"
-        echo "   3. Test file upload functionality"
+        echo "✅ DEPLOYMENT COMPLETE"

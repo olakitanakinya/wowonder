@@ -12,6 +12,8 @@ spec:
       labels:
         app: wowonder-app
     spec:
+      nodeSelector:
+        kubernetes.io/hostname: worker
       containers:
       - name: wowonder-app
         image: $DOCKER_IMAGE:latest
