@@ -198,7 +198,8 @@ jobs:
         MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}')
         kubectl logs $MYSQL_POD -n ${{ env.NAMESPACE }} --tail=20
 
-    - name: Initialize database
+
+        - name: Initialize database
       run: |
         echo "=== Initializing Database ==="
         MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}')
@@ -216,21 +217,7 @@ jobs:
         
         # Create database and user
         echo "Creating database and user..."
-        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE DATABASE IF NOT EXISTS wowonderdb;"
-        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE USER IF NOT EXISTS 'wowonderuser'@'%' IDENTIFIED BY 'Password123@24';"
-        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "GRANT ALL PRIVILEGES ON wowonderdb.* TO 'wowonderuser'@'%';"
-        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "FLUSH PRIVILEGES;"
-        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "SHOW DATABASES;"
-        
-        # Import SQL file
-        echo "Importing database schema from wowonderdb.sql..."
-        kubectl cp wowonderdb.sql ${{ env.NAMESPACE }}/$MYSQL_POD:/tmp/db.sql
-        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword wowonderdb < /tmp/db.sql
-        echo "✓ Database imported successfully"
-        
-        # Verify import
-        echo "Verifying database tables:"
-        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword wowonderdb -e "SHOW TABLES;"
+        kubectl
 
     - name: Deploy application
       run: |
