@@ -63,6 +63,7 @@ jobs:
         echo "=== Cleaning previous deployment ==="
         kubectl delete all --all -n ${{ env.NAMESPACE }} --ignore-not-found=true
         kubectl delete pvc -n ${{ env.NAMESPACE }} --all --ignore-not-found=true
+        kubectl delete pv --all --ignore-not-found=true
         kubectl delete namespace ${{ env.NAMESPACE }} --ignore-not-found=true
         sleep 10
 
@@ -71,63 +72,52 @@ jobs:
         kubectl create namespace ${{ env.NAMESPACE }}
         echo "Namespace ${{ env.NAMESPACE }} created"
 
+    - name: Setup storage directories
+      run: |
+        echo "=== Setting up storage directories on worker node ==="
+        # Create storage directories directly on the worker node
+        sudo mkdir -p /mnt/data/mysql /mnt/data/wowonder
+        sudo chmod -R 777 /mnt/data
+        echo "Storage directories created:"
+        ls -la /mnt/data/
+
     - name: Deploy storage
       run: |
         echo "=== Deploying Storage ==="
         kubectl apply -f k8s/storage.yaml
-        sleep 10
+        sleep 15
         echo "=== Storage Status ==="
         kubectl get pv,pvc -n ${{ env.NAMESPACE }} -o wide
+        echo "=== PV Details ==="
+        kubectl describe pv
+        echo "=== PVC Details ==="
+        kubectl describe pvc -n ${{ env.NAMESPACE }}
 
-    - name: Deploy MySQL with debugging
+    - name: Wait for storage to be ready
+      run: |
+        echo "=== Waiting for storage to be ready ==="
+        timeout 60s bash -c '
+          while true; do
+            MYSQL_PVC_STATUS=$(kubectl get pvc mysql-pvc -n ${{ env.NAMESPACE }} -o jsonpath="{.status.phase}" 2>/dev/null || echo "Pending")
+            WOWONDER_PVC_STATUS=$(kubectl get pvc wowonder-pvc -n ${{ env.NAMESPACE }} -o jsonpath="{.status.phase}" 2>/dev/null || echo "Pending")
+            
+            echo "MySQL PVC: $MYSQL_PVC_STATUS, Wowonder PVC: $WOWONDER_PVC_STATUS"
+            
+            if [ "$MYSQL_PVC_STATUS" = "Bound" ] && [ "$WOWONDER_PVC_STATUS" = "Bound" ]; then
+              echo "✓ Both PVCs are bound"
+              break
+            fi
+            sleep 5
+          done
+        '
+
+    - name: Deploy MySQL
       run: |
         echo "=== Deploying MySQL ==="
         kubectl apply -f k8s/mysql.yaml
         
-        echo "=== Waiting for MySQL with detailed debugging ==="
-        counter=0
-        max_wait=300
-        while [ $counter -lt $((max_wait/10)) ]; do
-          POD_NAME=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "NOT_FOUND")
-          POD_STATUS=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NOT_FOUND")
-          POD_READY=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
-          
-          echo "Wait cycle $counter: Pod=$POD_NAME, Status=$POD_STATUS, Ready=$POD_READY"
-          
-          if [ "$POD_READY" = "true" ]; then
-            echo "✓ MySQL pod is ready!"
-            break
-          fi
-          
-          # Show detailed status every 3 cycles
-          if [ $((counter % 3)) -eq 0 ]; then
-            echo "=== Detailed Pod Status ==="
-            kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o wide
-            
-            if [ "$POD_NAME" != "NOT_FOUND" ]; then
-              echo "=== Pod Events ==="
-              kubectl describe pod $POD_NAME -n ${{ env.NAMESPACE }} | grep -A 10 "Events:" || echo "No events"
-              
-              echo "=== Pod Logs ==="
-              kubectl logs $POD_NAME -n ${{ env.NAMESPACE }} --tail=20 || echo "No logs yet"
-            fi
-            
-            echo "=== PVC Status ==="
-            kubectl get pvc -n ${{ env.NAMESPACE }} -o wide
-          fi
-          
-          sleep 10
-          counter=$((counter + 1))
-        done
-        
-        if [ "$POD_READY" != "true" ]; then
-          echo "❌ MySQL pod failed to become ready"
-          echo "=== Final Debug Info ==="
-          kubectl get all -n ${{ env.NAMESPACE }}
-          kubectl describe pvc mysql-pvc -n ${{ env.NAMESPACE }} || echo "No PVC details"
-          exit 1
-        fi
-        
+        echo "=== Waiting for MySQL ==="
+        kubectl wait --for=condition=ready pod -l app=mysql -n ${{ env.NAMESPACE }} --timeout=300s
         echo "✅ MySQL is ready"
 
     - name: Initialize database
