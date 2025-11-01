@@ -24,16 +24,18 @@ jobs:
           echo "Updated port to 30080 in config.php"
         else
           echo "Creating config.php with correct port..."
-          echo '<?php' > config.php
-          echo '$sql_db_host = "mysql-service";' >> config.php
-          echo '$sql_db_user = "wowonderuser";' >> config.php
-          echo '$sql_db_pass = "Password123@24";' >> config.php
-          echo '$sql_db_name = "wowonderdb";' >> config.php
-          echo '$site_url = "http://44.220.139.238:30080";' >> config.php
-          echo '$auto_redirect = false;' >> config.php
-          echo '$purchase_code = "000000";' >> config.php
-          echo '$siteEncryptKey = "eb733cdb4d769426e460bad9df6b824eee3416d7";' >> config.php
-          echo '?>' >> config.php
+          cat > config.php << 'CONFIG_EOF'
+        <?php
+        \$sql_db_host = "mysql-service";
+        \$sql_db_user = "wowonderuser";
+        \$sql_db_pass = "Password123@24";
+        \$sql_db_name = "wowonderdb";
+        \$site_url = "http://44.220.139.238:30080";
+        \$auto_redirect = false;
+        \$purchase_code = "000000";
+        \$siteEncryptKey = "eb733cdb4d769426e460bad9df6b824eee3416d7";
+        ?>
+        CONFIG_EOF
         fi
 
     - name: Set up Docker Buildx
@@ -91,7 +93,7 @@ jobs:
     - name: Setup storage directories on worker node
       run: |
         echo "=== Setting up storage directories on worker node ==="
-        cat <<EOF | kubectl apply -f -
+        kubectl apply -f - << "STORAGE_EOF"
         apiVersion: batch/v1
         kind: Job
         metadata:
@@ -123,7 +125,7 @@ jobs:
                 hostPath:
                   path: /
                   type: Directory
-        EOF
+        STORAGE_EOF
 
         kubectl wait --for=condition=complete job/storage-setup -n ${{ env.NAMESPACE }} --timeout=60s
         kubectl logs job/storage-setup -n ${{ env.NAMESPACE }}
@@ -262,7 +264,7 @@ jobs:
     - name: Deploy Nginx ConfigMap with redirect fixes
       run: |
         echo "=== Deploying Nginx ConfigMap with Redirect Fixes ==="
-        cat <<EOF | kubectl apply -f -
+        kubectl apply -f - << "NGINX_EOF"
         apiVersion: v1
         kind: ConfigMap
         metadata:
@@ -287,47 +289,47 @@ jobs:
                 absolute_redirect off;
 
                 location / {
-                    try_files \$uri \$uri/ /index.php?\$query_string;
+                    try_files $uri $uri/ /index.php?$query_string;
                 }
 
                 location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|mp4|webm|ogg)$ {
                     expires 1y;
                     add_header Cache-Control "public, immutable";
-                    try_files \$uri \$uri/ =404;
+                    try_files $uri $uri/ =404;
                 }
 
                 location /upload/ {
                     alias /var/www/html/upload/;
                     expires 1y;
                     add_header Cache-Control "public, immutable";
-                    try_files \$uri \$uri/ =404;
+                    try_files $uri $uri/ =404;
                 }
 
                 location /assets/ {
                     alias /var/www/html/assets/;
                     expires 1y;
                     add_header Cache-Control "public";
-                    try_files \$uri \$uri/ =404;
+                    try_files $uri $uri/ =404;
                 }
 
                 location /themes/ {
                     alias /var/www/html/themes/;
                     expires 1y;
                     add_header Cache-Control "public";
-                    try_files \$uri \$uri/ =404;
+                    try_files $uri $uri/ =404;
                 }
 
                 location /admin-panel/ {
                     alias /var/www/html/admin-panel/;
-                    try_files \$uri \$uri/ /admin-panel/index.php?\$query_string;
+                    try_files $uri $uri/ /admin-panel/index.php?$query_string;
                 }
 
                 location ~ \.php$ {
                     include fastcgi_params;
                     fastcgi_pass 127.0.0.1:9000;
                     fastcgi_index index.php;
-                    fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-                    fastcgi_param PATH_INFO \$fastcgi_path_info;
+                    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                    fastcgi_param PATH_INFO $fastcgi_path_info;
                     
                     # Force HTTP and correct settings to prevent redirect loops
                     fastcgi_param HTTPS off;
@@ -344,13 +346,13 @@ jobs:
                     deny all;
                 }
             }
-        EOF
+        NGINX_EOF
         echo "✓ Nginx ConfigMap deployed with comprehensive redirect fixes"
 
     - name: Create fixed laravel deployment
       run: |
         echo "=== Creating Fixed Laravel Deployment ==="
-        cat > k8s/laravel-fixed.yaml << 'EOF'
+        cat > k8s/laravel-fixed.yaml << "LARAVEL_EOF"
         apiVersion: apps/v1
         kind: Deployment
         metadata:
@@ -443,10 +445,10 @@ jobs:
               port: 80
               targetPort: 80
               nodePort: 30080
-        EOF
+        LARAVEL_EOF
         
         # Replace the image placeholder
-        sed -i "s|\$DOCKER_IMAGE|${{ env.DOCKER_IMAGE }}|g" k8s/laravel-fixed.yaml
+        sed -i "s|\\$DOCKER_IMAGE|${{ env.DOCKER_IMAGE }}|g" k8s/laravel-fixed.yaml
         
         echo "✓ Fixed deployment configuration created"
 
@@ -454,46 +456,45 @@ jobs:
       run: |
         echo "=== Deploying Application with Fixed Configuration ==="
         kubectl apply -f k8s/laravel-fixed.yaml
-
+        
         echo "Waiting for pod to start with longer timeout..."
         
         # Wait with better debugging
-        timeout 300s bash -c '
-          counter=0
-          while true; do
-            POD_STATUS=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath="{.items[0].status.phase}" 2>/dev/null || echo "NotFound")
-            POD_NAME=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || echo "NotFound")
-            
-            echo "Wait cycle $counter: Pod $POD_NAME status: $POD_STATUS"
-            
-            if [ "$POD_STATUS" = "Running" ]; then
-              READY=$(kubectl get pod $POD_NAME -n ${{ env.NAMESPACE }} -o jsonpath="{.status.containerStatuses[0].ready}")
-              if [ "$READY" = "true" ]; then
-                echo "✓ Pod is ready!"
-                break
-              else
-                echo "⏳ Pod running but not ready yet..."
-                # Check what's not ready
-                kubectl get pod $POD_NAME -n ${{ env.NAMESPACE }} -o jsonpath="{.status.containerStatuses[0].state}" | jq '.' || echo "Checking container state"
-              fi
-            elif [ "$POD_STATUS" = "Pending" ] || [ "$POD_STATUS" = "ContainerCreating" ]; then
-              echo "⏳ Pod still starting: $POD_STATUS"
-              if [ $((counter % 5)) -eq 0 ]; then
-                # Every 5 cycles, show more details
-                kubectl describe pod $POD_NAME -n ${{ env.NAMESPACE }} | grep -A 10 "Events:" || echo "No events yet"
-              fi
-            elif [ "$POD_STATUS" = "NotFound" ]; then
-              echo "⏳ Pod not created yet..."
-            else
-              echo "❌ Pod in unexpected state: $POD_STATUS"
-              kubectl describe pod $POD_NAME -n ${{ env.NAMESPACE }}
+        counter=0
+        max_wait=300
+        while [ $counter -lt $((max_wait/10)) ]; do
+          POD_STATUS=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath="{.items[0].status.phase}" 2>/dev/null || echo "NotFound")
+          POD_NAME=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || echo "NotFound")
+          
+          echo "Wait cycle $counter: Pod $POD_NAME status: $POD_STATUS"
+          
+          if [ "$POD_STATUS" = "Running" ]; then
+            READY=$(kubectl get pod $POD_NAME -n ${{ env.NAMESPACE }} -o jsonpath="{.status.containerStatuses[0].ready}" 2>/dev/null || echo "false")
+            if [ "$READY" = "true" ]; then
+              echo "✓ Pod is ready!"
               break
+            else
+              echo "⏳ Pod running but not ready yet..."
+              # Check what's not ready
+              kubectl get pod $POD_NAME -n ${{ env.NAMESPACE }} -o jsonpath="{.status.containerStatuses[0].state}" 2>/dev/null | jq '.' 2>/dev/null || echo "Checking container state"
             fi
-            
-            sleep 10
-            counter=$((counter + 1))
-          done
-        '
+          elif [ "$POD_STATUS" = "Pending" ] || [ "$POD_STATUS" = "ContainerCreating" ]; then
+            echo "⏳ Pod still starting: $POD_STATUS"
+            if [ $((counter % 5)) -eq 0 ]; then
+              # Every 5 cycles, show more details
+              kubectl describe pod $POD_NAME -n ${{ env.NAMESPACE }} 2>/dev/null | grep -A 10 "Events:" || echo "No events yet"
+            fi
+          elif [ "$POD_STATUS" = "NotFound" ]; then
+            echo "⏳ Pod not created yet..."
+          else
+            echo "❌ Pod in unexpected state: $POD_STATUS"
+            kubectl describe pod $POD_NAME -n ${{ env.NAMESPACE }} 2>/dev/null || echo "Cannot describe pod"
+            break
+          fi
+          
+          sleep 10
+          counter=$((counter + 1))
+        done
         
         # Final verification
         echo "=== Final Pod Status ==="
@@ -508,7 +509,7 @@ jobs:
           POD_NAME=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || echo "NOT_FOUND")
           if [ "$POD_NAME" != "NOT_FOUND" ]; then
             echo "=== Nginx Logs ==="
-            kubectl logs $POD_NAME -n ${{ env.NAMESPACE }} | tail -20 || echo "No logs"
+            kubectl logs $POD_NAME -n ${{ env.NAMESPACE }} 2>/dev/null | tail -20 || echo "No logs available"
           fi
           exit 1
         fi
