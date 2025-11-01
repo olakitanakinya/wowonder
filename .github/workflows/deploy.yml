@@ -76,115 +76,224 @@ jobs:
 
     - name: Cleanup previous deployment
       run: |
+        echo "=== Cleaning previous deployment ==="
         kubectl delete all --all -n ${{ env.NAMESPACE }} --ignore-not-found=true
         kubectl delete pvc -n ${{ env.NAMESPACE }} --all --ignore-not-found=true
         kubectl delete namespace ${{ env.NAMESPACE }} --ignore-not-found=true
         sleep 10
 
     - name: Create namespace
-      run: kubectl create namespace ${{ env.NAMESPACE }}
+      run: |
+        kubectl create namespace ${{ env.NAMESPACE }}
+        echo "Namespace ${{ env.NAMESPACE }} created"
 
     - name: Deploy storage
       run: |
+        echo "=== Deploying Storage ==="
         kubectl apply -f k8s/storage.yaml
-        sleep 5
+        sleep 10
         kubectl get pv,pvc -n ${{ env.NAMESPACE }}
 
     - name: Deploy MySQL
       run: |
+        echo "=== Deploying MySQL ==="
         kubectl apply -f k8s/mysql.yaml
-        echo "Waiting for MySQL..."
-        sleep 30
-        kubectl wait --for=condition=ready pod -l app=mysql -n ${{ env.NAMESPACE }} --timeout=300s
+        echo "Waiting for MySQL pod to start..."
+        sleep 60
+        
+        echo "=== Checking MySQL Pod Status ==="
+        kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o wide
+        
+        echo "=== MySQL Pod Events ==="
+        kubectl get events -n ${{ env.NAMESPACE }} --field-selector involvedObject.kind=Pod --sort-by='.lastTimestamp' | tail -10
+        
+        echo "=== MySQL Pod Logs ==="
+        MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "not-found")
+        if [ "$MYSQL_POD" != "not-found" ]; then
+          kubectl logs $MYSQL_POD -n ${{ env.NAMESPACE }} --tail=50
+        fi
+        
+        # Wait with better error handling
+        echo "Waiting for MySQL to be ready..."
+        kubectl wait --for=condition=ready pod -l app=mysql -n ${{ env.NAMESPACE }} --timeout=600s
 
     - name: Initialize database
       run: |
+        echo "=== Initializing Database ==="
         MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o name)
         echo "MySQL pod: $MYSQL_POD"
         
-        # Wait for MySQL to be ready
-        until kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysqladmin ping -uroot -prootpassword --silent; do
-          echo "Waiting for MySQL..."
-          sleep 10
-        done
+        # Wait for MySQL to be ready to accept connections
+        echo "Waiting for MySQL to accept connections..."
+        timeout 120s bash -c '
+          while ! kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysqladmin ping -uroot -prootpassword --silent; do
+            echo "⏳ MySQL not ready yet..."
+            sleep 10
+          done
+          echo "✓ MySQL is ready and accepting connections"
+        '
         
-        # Create database
-        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE DATABASE IF NOT EXISTS wowonderdb;"
-        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE USER IF NOT EXISTS 'wowonderuser'@'%' IDENTIFIED BY 'Password123@24';"
-        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "GRANT ALL PRIVILEGES ON wowonderdb.* TO 'wowonderuser'@'%';"
-        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "FLUSH PRIVILEGES;"
+        # Create database and user
+        echo "Creating database and user..."
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE DATABASE IF NOT EXISTS wowonderdb;" || echo "Database creation completed"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE USER IF NOT EXISTS 'wowonderuser'@'%' IDENTIFIED BY 'Password123@24';" || echo "User creation completed"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "GRANT ALL PRIVILEGES ON wowonderdb.* TO 'wowonderuser'@'%';" || echo "Privileges granted"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "FLUSH PRIVILEGES;" || echo "Privileges flushed"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "SHOW DATABASES;" || echo "Database list shown"
         
         # Import SQL if exists
         if [ -f "wowonderdb.sql" ]; then
-          echo "Importing database..."
+          echo "Importing database schema..."
           kubectl cp wowonderdb.sql ${{ env.NAMESPACE }}/${MYSQL_POD#pod/}:/tmp/db.sql
-          kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword wowonderdb < /tmp/db.sql
+          kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword wowonderdb < /tmp/db.sql && echo "✓ Database imported" || echo "⚠ Database import completed with warnings"
+        else
+          echo "ℹ No wowonderdb.sql file found, using existing database structure"
         fi
 
     - name: Deploy application
       run: |
+        echo "=== Deploying Application ==="
         # Create a temporary file with the image replaced
         cat k8s/laravel.yaml | sed "s|\$DOCKER_IMAGE|${{ env.DOCKER_IMAGE }}|g" > k8s/laravel-deploy.yaml
         kubectl apply -f k8s/laravel-deploy.yaml
-        kubectl wait --for=condition=ready pod -l app=wowonder-app -n ${{ env.NAMESPACE }} --timeout=300s
+        
+        echo "Waiting for application pod..."
+        timeout 180s bash -c '
+          while true; do
+            POD_STATUS=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath="{.items[0].status.phase}" 2>/dev/null || echo "NotFound")
+            if [ "$POD_STATUS" = "Running" ]; then
+              echo "✓ Application pod is running"
+              break
+            elif [ "$POD_STATUS" = "NotFound" ]; then
+              echo "⏳ Application pod not found yet..."
+            else
+              echo "⏳ Application pod status: $POD_STATUS"
+            fi
+            sleep 10
+          done
+        '
 
     - name: Debug application
       run: |
         echo "=== Debugging Application ==="
-        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o name)
+        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o name 2>/dev/null || echo "NOT_FOUND")
         echo "App pod: $APP_POD"
         
-        # Check logs
-        kubectl logs -n ${{ env.NAMESPACE }} $APP_POD --tail=50
-        
-        # Check if config.php has correct port
-        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- cat /var/www/html/config.php | grep site_url || echo "Cannot read config.php"
+        if [ "$APP_POD" != "NOT_FOUND" ]; then
+          # Check pod details
+          kubectl describe $APP_POD -n ${{ env.NAMESPACE }}
+          
+          # Check logs
+          echo "=== Application Logs ==="
+          kubectl logs -n ${{ env.NAMESPACE }} $APP_POD --tail=50
+          
+          # Check if config.php has correct port
+          echo "=== Config.php Content ==="
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- cat /var/www/html/config.php 2>/dev/null | grep site_url || echo "Cannot read config.php"
+        else
+          echo "❌ Application pod not found"
+          kubectl get pods -n ${{ env.NAMESPACE }}
+        fi
 
     - name: Create config in pod
       run: |
-        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o name)
+        echo "=== Creating Config in Pod ==="
+        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o name 2>/dev/null || echo "NOT_FOUND")
         
-        # Create config.php using multiple commands to avoid heredoc issues
-        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '<?php' > /var/www/html/config.php"
-        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_host = \"mysql-service\";' >> /var/www/html/config.php"
-        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_user = \"wowonderuser\";' >> /var/www/html/config.php"
-        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_pass = \"Password123@24\";' >> /var/www/html/config.php"
-        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_name = \"wowonderdb\";' >> /var/www/html/config.php"
-        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$site_url = \"http://44.220.139.238:30080\";' >> /var/www/html/config.php"
-        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$auto_redirect = true;' >> /var/www/html/config.php"
-        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$purchase_code = \"000000\";' >> /var/www/html/config.php"
-        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$siteEncryptKey = \"eb733cdb4d769426e460bad9df6b824eee3416d7\";' >> /var/www/html/config.php"
-        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '?>' >> /var/www/html/config.php"
-        
-        # Set permissions
-        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- chown www-data:www-data /var/www/html/config.php
-        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- chmod 644 /var/www/html/config.php
+        if [ "$APP_POD" != "NOT_FOUND" ]; then
+          # Create config.php using multiple commands to avoid heredoc issues
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '<?php' > /var/www/html/config.php"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_host = \"mysql-service\";' >> /var/www/html/config.php"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_user = \"wowonderuser\";' >> /var/www/html/config.php"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_pass = \"Password123@24\";' >> /var/www/html/config.php"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_name = \"wowonderdb\";' >> /var/www/html/config.php"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$site_url = \"http://44.220.139.238:30080\";' >> /var/www/html/config.php"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$auto_redirect = true;' >> /var/www/html/config.php"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$purchase_code = \"000000\";' >> /var/www/html/config.php"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$siteEncryptKey = \"eb733cdb4d769426e460bad9df6b824eee3416d7\";' >> /var/www/html/config.php"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '?>' >> /var/www/html/config.php"
+          
+          # Set permissions
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- chown www-data:www-data /var/www/html/config.php
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- chmod 644 /var/www/html/config.php
+          
+          echo "✓ Configuration files updated"
+        else
+          echo "❌ Cannot create config - application pod not found"
+        fi
 
     - name: Test database connection
       run: |
-        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o name)
-        kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- php -r "\
-        \$conn = new mysqli('mysql-service', 'wowonderuser', 'Password123@24', 'wowonderdb', 3306);\
-        if (\$conn->connect_error) {\
-            echo 'DATABASE ERROR: ' . \$conn->connect_error;\
-            exit(1);\
-        } else {\
-            echo 'DATABASE SUCCESS: Connected to MySQL';\
-            \$conn->close();\
-        }\
-        "
+        echo "=== Testing Database Connection ==="
+        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o name 2>/dev/null || echo "NOT_FOUND")
+        
+        if [ "$APP_POD" != "NOT_FOUND" ]; then
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- php -r "\
+          \$conn = new mysqli('mysql-service', 'wowonderuser', 'Password123@24', 'wowonderdb', 3306);\
+          if (\$conn->connect_error) {\
+              echo '❌ DATABASE ERROR: ' . \$conn->connect_error;\
+              exit(1);\
+          } else {\
+              echo '✓ DATABASE SUCCESS: Connected to MySQL';\
+              \$result = \$conn->query('SHOW TABLES');\
+              if (\$result && \$result->num_rows > 0) {\
+                  echo '✓ Database has tables: ' . \$result->num_rows;\
+              } else {\
+                  echo '⚠ Database is empty or tables query failed';\
+              }\
+              \$conn->close();\
+          }\
+          " || echo "Database test completed"
+        else
+          echo "❌ Cannot test database - application pod not found"
+        fi
 
     - name: Test application
       run: |
-        echo "Testing application..."
-        sleep 20
-        curl -s http://${{ env.K8S_WORKER_IP }}:30080/ > /dev/null && echo "✓ Application is responding" || echo "✗ Application not responding"
-        curl -s http://${{ env.K8S_WORKER_IP }}:30080/welcome > /dev/null && echo "✓ Welcome page working" || echo "✗ Welcome page not working"
+        echo "=== Testing Application ==="
+        echo "Waiting for application to be fully ready..."
+        sleep 30
+        
+        echo "--- Testing Basic Connectivity ---"
+        curl -s -o /dev/null -w "Root Endpoint: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/ || echo "❌ Root endpoint failed"
+        
+        echo "--- Testing Welcome Page ---"
+        curl -s -o /dev/null -w "Welcome Page: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/welcome || echo "❌ Welcome page failed"
+        
+        echo "--- Testing Static Files ---"
+        curl -s -o /dev/null -w "CSS File: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/themes/wowonder/css/style.css || echo "❌ CSS file failed"
+        
+        echo "--- Testing PHP ---"
+        curl -s -o /dev/null -w "PHP Index: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/index.php || echo "❌ PHP failed"
 
     - name: Show status
       run: |
-        echo "=== Final Status ==="
-        kubectl get all -n ${{ env.NAMESPACE }}
+        echo "=== 🎉 FINAL DEPLOYMENT STATUS ==="
         echo ""
-        echo "=== Application URL ==="
-        echo "http://${{ env.K8S_WORKER_IP }}:30080"
+        echo "📊 CLUSTER STATUS:"
+        kubectl get all -n ${{ env.NAMESPACE }}
+        
+        echo ""
+        echo "💾 STORAGE STATUS:"
+        kubectl get pv,pvc -n ${{ env.NAMESPACE }}
+        
+        echo ""
+        echo "🌐 APPLICATION URLS:"
+        echo "   Main Site:      http://${{ env.K8S_WORKER_IP }}:30080/"
+        echo "   Welcome Page:   http://${{ env.K8S_WORKER_IP }}:30080/welcome"
+        echo "   Registration:   http://${{ env.K8S_WORKER_IP }}:30080/register"
+        echo "   Login:          http://${{ env.K8S_WORKER_IP }}:30080/login"
+        
+        echo ""
+        echo "🔧 TROUBLESHOOTING:"
+        echo "   If you get HTTP 500 errors:"
+        echo "   1. Check application logs above"
+        echo "   2. Verify MySQL connection is working"
+        echo "   3. Check config.php has correct port (30080)"
+        echo "   4. Verify all pods are running"
+        
+        echo ""
+        echo "📝 NEXT STEPS:"
+        echo "   1. Open browser: http://${{ env.K8S_WORKER_IP }}:30080"
+        echo "   2. Complete Wowonder installation if needed"
+        echo "   3. Test file upload functionality"

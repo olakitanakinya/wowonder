@@ -24,9 +24,37 @@ spec:
           value: "wowonderuser"
         - name: MYSQL_PASSWORD
           value: "Password123@24"
+        args:
+        - --default-authentication-plugin=mysql_native_password
+        - --innodb-buffer-pool-size=64M
         volumeMounts:
         - name: mysql-data
           mountPath: /var/lib/mysql
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - "mysqladmin ping -uroot -prootpassword"
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - "mysql -uroot -prootpassword -e 'SELECT 1'"
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          timeoutSeconds: 3
       volumes:
       - name: mysql-data
         persistentVolumeClaim:
