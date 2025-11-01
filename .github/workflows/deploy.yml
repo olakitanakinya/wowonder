@@ -331,14 +331,160 @@ jobs:
     - name: Deploy Nginx ConfigMap
       run: |
         echo "=== Deploying Nginx ConfigMap ==="
-        kubectl apply -f k8s/nginx-config.yaml
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: wowonder-nginx-config
+          namespace: ${{ env.NAMESPACE }}
+        data:
+          default.conf: |
+            server {
+                listen 80;
+                server_name _;
+                root /var/www/html;
+                index index.php index.html;
+
+                client_max_body_size 2024M;
+                client_body_timeout 5000s;
+                fastcgi_read_timeout 4000s;
+                fastcgi_send_timeout 4000s;
+
+                location / {
+                    try_files \$uri \$uri/ /index.php?\$query_string;
+                }
+
+                location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|mp4|webm|ogg)$ {
+                    expires 1y;
+                    add_header Cache-Control "public, immutable";
+                    try_files \$uri \$uri/ =404;
+                }
+
+                location /upload/ {
+                    alias /var/www/html/upload/;
+                    expires 1y;
+                    add_header Cache-Control "public, immutable";
+                    try_files \$uri \$uri/ =404;
+                }
+
+                location /assets/ {
+                    alias /var/www/html/assets/;
+                    expires 1y;
+                    add_header Cache-Control "public";
+                    try_files \$uri \$uri/ =404;
+                }
+
+                location /themes/ {
+                    alias /var/www/html/themes/;
+                    expires 1y;
+                    add_header Cache-Control "public";
+                    try_files \$uri \$uri/ =404;
+                }
+
+                location /admin-panel/ {
+                    alias /var/www/html/admin-panel/;
+                    try_files \$uri \$uri/ /admin-panel/index.php?\$query_string;
+                }
+
+                location ~ \.php$ {
+                    include fastcgi_params;
+                    fastcgi_pass 127.0.0.1:9000;
+                    fastcgi_index index.php;
+                    fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+                    fastcgi_param PATH_INFO \$fastcgi_path_info;
+                }
+
+                location ~ /\.ht {
+                    deny all;
+                }
+            }
+        EOF
+        echo "✓ Nginx ConfigMap deployed"
 
     - name: Deploy application
       run: |
         echo "=== Deploying Application ==="
         # Create a temporary file with the image replaced
-        cat k8s/laravel.yaml | sed "s|\$DOCKER_IMAGE|${{ env.DOCKER_IMAGE }}|g" > k8s/laravel-deploy.yaml
-        kubectl apply -f k8s/laravel-deploy.yaml
+        cat <<EOF | sed "s|\$DOCKER_IMAGE|${{ env.DOCKER_IMAGE }}|g" | kubectl apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: wowonder-app
+          namespace: ${{ env.NAMESPACE }}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: wowonder-app
+          template:
+            metadata:
+              labels:
+                app: wowonder-app
+            spec:
+              nodeSelector:
+                kubernetes.io/hostname: worker
+              containers:
+              - name: wowonder-app
+                image: \$DOCKER_IMAGE:latest
+                ports:
+                - containerPort: 80
+                volumeMounts:
+                - name: nginx-config
+                  mountPath: /etc/nginx/conf.d/default.conf
+                  subPath: default.conf
+                env:
+                - name: DB_HOST
+                  value: "mysql-service"
+                - name: DB_DATABASE
+                  value: "wowonderdb"
+                - name: DB_USERNAME
+                  value: "wowonderuser"
+                - name: DB_PASSWORD
+                  value: "Password123@24"
+                - name: SITE_URL
+                  value: "http://44.220.139.238:30080"
+                resources:
+                  requests:
+                    memory: "512Mi"
+                    cpu: "250m"
+                  limits:
+                    memory: "1Gi"
+                    cpu: "500m"
+                livenessProbe:
+                  httpGet:
+                    path: /index.php
+                    port: 80
+                  initialDelaySeconds: 60
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+                readinessProbe:
+                  httpGet:
+                    path: /index.php
+                    port: 80
+                  initialDelaySeconds: 30
+                  periodSeconds: 5
+                  timeoutSeconds: 3
+                  failureThreshold: 3
+              volumes:
+              - name: nginx-config
+                configMap:
+                  name: wowonder-nginx-config
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: wowonder-service
+          namespace: ${{ env.NAMESPACE }}
+        spec:
+          type: NodePort
+          selector:
+            app: wowonder-app
+          ports:
+          - port: 80
+            targetPort: 80
+            nodePort: 30080
+        EOF
 
         echo "Waiting for application pod..."
         timeout 180s bash -c '
@@ -356,13 +502,32 @@ jobs:
           done
         '
 
+    - name: Verify application files
+      run: |
+        echo "=== Verifying Application Files ==="
+        APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "NOT_FOUND")
+
+        if [ "$APP_POD" != "NOT_FOUND" ]; then
+          echo "Checking application structure:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ls -la /var/www/html/
+          echo "Checking if themes directory exists:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ls -la /var/www/html/themes/ || echo "Themes directory not found"
+          echo "Checking if index.php exists:"
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ls -la /var/www/html/index.php || echo "index.php not found"
+        else
+          echo "❌ Application pod not found for verification"
+        fi
+
     - name: Create config in pod
       run: |
         echo "=== Creating Config in Pod ==="
         APP_POD=$(kubectl get pods -l app=wowonder-app -n ${{ env.NAMESPACE }} -o name 2>/dev/null || echo "NOT_FOUND")
 
         if [ "$APP_POD" != "NOT_FOUND" ]; then
-          # Create config.php using multiple commands to avoid heredoc issues
+          echo "Checking if application files exist..."
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ls -la /var/www/html/ || echo "Application directory empty"
+          
+          # Only create config.php if it doesn't exist or we need to update it
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '<?php' > /var/www/html/config.php"
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_host = \"mysql-service\";' >> /var/www/html/config.php"
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- sh -c "echo '\$sql_db_user = \"wowonderuser\";' >> /var/www/html/config.php"
@@ -418,7 +583,7 @@ jobs:
           echo "Checking application structure:"
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ls -la /var/www/html/
           echo "Checking themes directory:"
-          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ls -la /var/www/html/themes/
+          kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- ls -la /var/www/html/themes/ || echo "Themes directory not found"
           
           echo "Checking Nginx configuration:"
           kubectl exec -n ${{ env.NAMESPACE }} $APP_POD -- cat /etc/nginx/conf.d/default.conf

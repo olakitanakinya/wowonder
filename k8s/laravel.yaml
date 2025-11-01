@@ -82,14 +82,37 @@ spec:
     spec:
       nodeSelector:
         kubernetes.io/hostname: worker
+      initContainers:
+      - name: setup-permissions
+        image: busybox:1.35
+        command: ['sh', '-c', '
+          echo "Setting up directories and permissions..." &&
+          mkdir -p /var/www/html/upload /var/www/html/cache /var/www/html/admin-panel &&
+          chown -R www-data:www-data /var/www/html &&
+          chmod -R 755 /var/www/html/upload &&
+          chmod -R 755 /var/www/html/cache &&
+          chmod -R 755 /var/www/html/admin-panel &&
+          echo "Permissions setup completed"
+        ']
+        volumeMounts:
+        - name: upload-data
+          mountPath: /var/www/html/upload
+        - name: cache-data
+          mountPath: /var/www/html/cache
+        - name: admin-panel-data
+          mountPath: /var/www/html/admin-panel
       containers:
       - name: wowonder-app
         image: $DOCKER_IMAGE:latest
         ports:
         - containerPort: 80
         volumeMounts:
-        - name: app-data
-          mountPath: /var/www/html
+        - name: upload-data
+          mountPath: /var/www/html/upload
+        - name: cache-data
+          mountPath: /var/www/html/cache
+        - name: admin-panel-data
+          mountPath: /var/www/html/admin-panel
         - name: nginx-config
           mountPath: /etc/nginx/conf.d/default.conf
           subPath: default.conf
@@ -128,9 +151,13 @@ spec:
           timeoutSeconds: 3
           failureThreshold: 3
       volumes:
-      - name: app-data
+      - name: upload-data
         persistentVolumeClaim:
           claimName: wowonder-pvc
+      - name: cache-data
+        emptyDir: {}
+      - name: admin-panel-data
+        emptyDir: {}
       - name: nginx-config
         configMap:
           name: wowonder-nginx-config
