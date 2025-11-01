@@ -198,8 +198,7 @@ jobs:
         MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}')
         kubectl logs $MYSQL_POD -n ${{ env.NAMESPACE }} --tail=20
 
-
-        - name: Initialize database
+    - name: Initialize database
       run: |
         echo "=== Initializing Database ==="
         MYSQL_POD=$(kubectl get pods -l app=mysql -n ${{ env.NAMESPACE }} -o jsonpath='{.items[0].metadata.name}')
@@ -217,7 +216,44 @@ jobs:
         
         # Create database and user
         echo "Creating database and user..."
-        kubectl
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE DATABASE IF NOT EXISTS wowonderdb;"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "CREATE USER IF NOT EXISTS 'wowonderuser'@'%' IDENTIFIED BY 'Password123@24';"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "GRANT ALL PRIVILEGES ON wowonderdb.* TO 'wowonderuser'@'%';"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "FLUSH PRIVILEGES;"
+        kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword -e "SHOW DATABASES;"
+        
+        # Import SQL file with better error handling
+        echo "Importing database schema from wowonderdb.sql..."
+        if [ -f "wowonderdb.sql" ]; then
+          echo "✓ wowonderdb.sql file found, size: $(wc -l < wowonderdb.sql) lines"
+          
+          # Copy file to pod
+          echo "Copying SQL file to MySQL pod..."
+          kubectl cp wowonderdb.sql ${{ env.NAMESPACE }}/$MYSQL_POD:/tmp/db.sql
+          
+          # Verify file was copied
+          echo "Verifying file copy..."
+          kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- ls -la /tmp/db.sql
+          
+          # Import database
+          echo "Importing database schema..."
+          kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- bash -c "mysql -uroot -prootpassword wowonderdb < /tmp/db.sql"
+          echo "✓ Database imported successfully"
+          
+          # Verify import
+          echo "Verifying database tables:"
+          kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword wowonderdb -e "SHOW TABLES;"
+          
+          # Count tables
+          TABLE_COUNT=$(kubectl exec -n ${{ env.NAMESPACE }} $MYSQL_POD -- mysql -uroot -prootpassword wowonderdb -e "SHOW TABLES;" | wc -l)
+          echo "✓ Database has $((TABLE_COUNT - 1)) tables"
+        else
+          echo "⚠ wowonderdb.sql not found, skipping import (using empty database)"
+          echo "Available files:"
+          ls -la *.sql 2>/dev/null || echo "No SQL files found"
+        fi
+        
+        echo "✅ Database initialization completed"
 
     - name: Deploy application
       run: |
@@ -308,7 +344,7 @@ jobs:
         curl -s -o /dev/null -w "Welcome Page: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/welcome || echo "❌ Welcome page failed"
         
         echo "--- Testing Static Files ---"
-        curl -s -o /dev/null -w "CSS File: %{http_code}\n" http://$${{ env.K8S_WORKER_IP }}:30080/themes/wowonder/css/style.css || echo "❌ CSS file failed"
+        curl -s -o /dev/null -w "CSS File: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/themes/wowonder/css/style.css || echo "❌ CSS file failed"
         
         echo "--- Testing PHP ---"
         curl -s -o /dev/null -w "PHP Index: %{http_code}\n" http://${{ env.K8S_WORKER_IP }}:30080/index.php || echo "❌ PHP failed"
