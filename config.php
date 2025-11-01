@@ -18,7 +18,7 @@ $sql_db_pass = "Password123@24";
 $sql_db_name = "wowonderdb";
 
 // Site URL
-$site_url = "http://44.220.139.238:3008"; // e.g (http://example.com)
+$site_url = "http://44.220.139.238:30080"; // e.g (http://example.com)
 
 $auto_redirect = true;
 
