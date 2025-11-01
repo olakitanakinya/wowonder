@@ -4,7 +4,6 @@ metadata:
   name: mysql
   namespace: wowonder
 spec:
-  replicas: 1
   selector:
     matchLabels:
       app: mysql
@@ -25,41 +24,9 @@ spec:
           value: "wowonderuser"
         - name: MYSQL_PASSWORD
           value: "Password123@24"
-        args:
-        - --default-authentication-plugin=mysql_native_password
         volumeMounts:
         - name: mysql-data
           mountPath: /var/lib/mysql
-        resources:
-          requests:
-            memory: "256Mi"
-            cpu: "250m"
-          limits:
-            memory: "512Mi"
-            cpu: "500m"
-        livenessProbe:
-          exec:
-            command:
-            - mysqladmin
-            - ping
-            - -h
-            - localhost
-            - -uroot
-            - -prootpassword
-          initialDelaySeconds: 30
-          periodSeconds: 10
-        readinessProbe:
-          exec:
-            command:
-            - mysql
-            - -h
-            - localhost
-            - -uroot
-            - -prootpassword
-            - -e
-            - "SELECT 1;"
-          initialDelaySeconds: 5
-          periodSeconds: 5
       volumes:
       - name: mysql-data
         persistentVolumeClaim:
@@ -74,6 +41,5 @@ spec:
   selector:
     app: mysql
   ports:
-    - protocol: TCP
-      port: 3306
-      targetPort: 3306
+  - port: 3306
+    targetPort: 3306
