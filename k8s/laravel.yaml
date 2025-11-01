@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wowonder-app
+  namespace: wowonder
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wowonder-app
+  template:
+    metadata:
+      labels:
+        app: wowonder-app
+    spec:
+      containers:
+      - name: wowonder-app
+        image: $DOCKERHUB_USERNAME/wowonder-laravel:latest
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: app-data
+          mountPath: /var/www/html/upload
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: app-data
+        persistentVolumeClaim:
+          claimName: wowonder-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wowonder-service
+  namespace: wowonder
+spec:
+  type: NodePort
+  selector:
+    app: wowonder-app
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+      nodePort: 30080

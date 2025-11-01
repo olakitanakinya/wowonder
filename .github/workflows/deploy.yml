@@ -1,91 +1,22 @@
-name: Build and Deploy Wowonder to Kubernetes
-
+name: Deploy Wowonder
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch:
-
-env:
-  NAMESPACE: wowonder
-  K8S_MASTER: 54.159.42.214
-  K8S_WORKER: 44.220.139.238
+    branches: [main]
 
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
-    - name: Log in to Docker Hub
-      uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.DOCKERHUB_USERNAME }}
-        password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-    - name: Build and push Laravel image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: ./Dockerfile
-        push: true
-        tags: |
-          ${{ secrets.DOCKERHUB_USERNAME }}/wowonder-laravel:latest
-          ${{ secrets.DOCKERHUB_USERNAME }}/wowonder-laravel:${{ github.sha }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
-
-  setup-infrastructure:
-    needs: build-and-push
-    runs-on: self-hosted
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Setup SSH for node access
-      run: |
-        mkdir -p ~/.ssh
-        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/k8s_access_key
-        chmod 600 ~/.ssh/k8s_access_key
-        cat >> ~/.ssh/config << EOF
-        Host k8s-master
-          HostName ${{ env.K8S_MASTER }}
-          User ubuntu
-          IdentityFile ~/.ssh/k8s_access_key
-          StrictHostKeyChecking no
-        Host k8s-worker
-          HostName ${{ env.K8S_WORKER }}
-          User ubuntu
-          IdentityFile ~/.ssh/k8s_access_key
-          StrictHostKeyChecking no
-        EOF
-
-    - name: Create shared storage directories on all nodes
-      run: |
-        echo "Creating shared storage directories..."
-        for node in k8s-master k8s-worker; do
-          ssh $node "sudo mkdir -p /mnt/data/wowonder /mnt/data/mysql && sudo chmod -R 777 /mnt/data"
-          echo "Storage directories created on $node"
-        done
-
   deploy:
-    needs: [build-and-push, setup-infrastructure]
     runs-on: self-hosted
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Setup Kubernetes
+    - name: Setup k8s
       uses: azure/setup-kubectl@v3
-
+      
     - name: Configure kubeconfig
       run: |
         mkdir -p ~/.kube
         echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config
-        kubectl config set-cluster kubernetes --server=https://${{ env.K8S_MASTER }}:6443 --insecure-skip-tls-verify=true
         kubectl get nodes
 
     - name: Create namespace
@@ -96,49 +27,29 @@ jobs:
 
     - name: Deploy MySQL
       run: |
-        kubectl apply -f k8s/mysql-deployment.yaml
-        # Wait for MySQL to be ready
-        kubectl wait --for=condition=ready pod -l app=mysql -n ${{ env.NAMESPACE }} --timeout=600s
+        kubectl apply -f k8s/mysql.yaml
+        kubectl wait --for=condition=ready pod -l app=mysql -n wowonder --timeout=300s
 
     - name: Initialize database
       run: |
-        # Update the database init configmap with actual SQL file
+        POD=$(kubectl get pods -l app=mysql -n wowonder -o name)
+        kubectl exec -n wowonder $POD -- mysql -uroot -prootpassword -e "
+          CREATE DATABASE IF NOT EXISTS wowonderdb;
+          CREATE USER IF NOT EXISTS 'wowonderuser'@'%' IDENTIFIED BY 'Password123@24';
+          GRANT ALL PRIVILEGES ON wowonderdb.* TO 'wowonderuser'@'%';
+          FLUSH PRIVILEGES;
+        "
         if [ -f "wowonderdb.sql" ]; then
-          kubectl create configmap wowonder-database-init \
-            --from-file=init.sql=wowonderdb.sql \
-            -n ${{ env.NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+          kubectl cp wowonderdb.sql wowonder/$POD:/tmp/db.sql
+          kubectl exec -n wowonder $POD -- mysql -uroot -prootpassword wowonderdb < /tmp/db.sql
         fi
-        
-        # Run database initialization job
-        kubectl apply -f k8s/mysql-init-job.yaml
-        
-        # Wait for job completion
-        kubectl wait --for=condition=complete job/mysql-init -n ${{ env.NAMESPACE }} --timeout=300s
 
-    - name: Deploy Wowonder application
+    - name: Deploy application
       run: |
-        # Update the image in the deployment
-        cat k8s/laravel-deployment.yaml | sed "s|YOUR_DOCKERHUB_USERNAME|${{ secrets.DOCKERHUB_USERNAME }}|g" | kubectl apply -f -
+        sed "s|\$DOCKERHUB_USERNAME|${{ secrets.DOCKERHUB_USERNAME }}|g" k8s/laravel.yaml | kubectl apply -f -
+        kubectl wait --for=condition=ready pod -l app=wowonder-app -n wowonder --timeout=300s
 
-    - name: Wait for application
+    - name: Verify
       run: |
-        kubectl wait --for=condition=ready pod -l app=wowonder-laravel -n ${{ env.NAMESPACE }} --timeout=300s
-
-    - name: Verify deployment
-      run: |
-        echo "=== Deployment Status ==="
-        kubectl get all -n ${{ env.NAMESPACE }}
-        echo ""
-        echo "=== Storage Status ==="
-        kubectl get pv,pvc -n ${{ env.NAMESPACE }}
-        echo ""
-        echo "=== Application URLs ==="
-        echo "Wowonder Application: http://${{ env.K8S_WORKER }}:30080"
-        echo "Welcome Page: http://${{ env.K8S_WORKER }}:30080/welcome"
-
-    - name: Test application
-      run: |
-        echo "Testing application endpoints..."
-        sleep 30
-        curl -f http://${{ env.K8S_WORKER }}:30080/ || echo "Application is starting..."
-        curl -f http://${{ env.K8S_WORKER }}:30080/welcome || echo "Welcome page is starting..."
+        kubectl get all,pv,pvc -n wowonder
+        echo "App URL: http://44.220.139.238:30080"
